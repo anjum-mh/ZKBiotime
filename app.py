@@ -60,6 +60,22 @@ def init_db():
         )
     ''')
     
+    # Ensure unique index exists so SQLite UPSERT never fails
+    c.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_unique 
+        ON attendance_logs (emp_id, record_date, shift_name)
+    ''')
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('admin_pass', 'admin123')")
+    c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('viewer_pass', 'viewer123')")
+    
     try:
         c.execute("ALTER TABLE attendance_logs ADD COLUMN excuse_reason TEXT")
     except sqlite3.OperationalError:
@@ -70,19 +86,131 @@ def init_db():
 
 init_db()
 
+def get_db_password(role_key):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM app_settings WHERE key = ?", (role_key,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res else ('admin123' if role_key == 'admin_pass' else 'viewer123')
+
+def update_db_password(role_key, new_pass):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (role_key, new_pass))
+    conn.commit()
+    conn.close()
+
+# --- ID NORMALIZATION & FETCH HELPERS (PRESERVING LEADING ZEROS) ---
+def normalize_emp_id(val):
+    """Strips whitespace while keeping exact ID strings (including leading zeros like 25-AI-01)."""
+    if pd.isna(val):
+        return ""
+    return str(val).strip()
+
+def load_all_attendance_logs():
+    """Always query fresh data directly from SQLite DB."""
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+    conn.close()
+    if not df.empty:
+        df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
+    return df
+
+# --- AUTHENTICATION GATEWAY WITH URL QUERY PARAMS PERSISTENCE ---
+query_params = st.query_params
+
+if 'authenticated' not in st.session_state:
+    if query_params.get("role") in ['Admin', 'Viewer']:
+        st.session_state['authenticated'] = True
+        st.session_state['role'] = query_params.get("role")
+    else:
+        st.session_state['authenticated'] = False
+        st.session_state['role'] = None
+
+if not st.session_state['authenticated']:
+    st.title("🔐 Enterprise Attendance Suite — Secure Login")
+    st.markdown("Please log in with your assigned credentials to access the portal.")
+    
+    with st.form("login_form"):
+        role_choice = st.selectbox("Select Role:", ["Viewer (Read-Only)", "Admin (Full Access)"])
+        password_input = st.text_input("Enter Password:", type="password")
+        submit_login = st.form_submit_button("Login to Portal", type="primary")
+        
+        if submit_login:
+            current_admin_pass = get_db_password('admin_pass')
+            current_viewer_pass = get_db_password('viewer_pass')
+            
+            if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
+                st.session_state['authenticated'] = True
+                st.session_state['role'] = 'Admin'
+                st.query_params["role"] = "Admin"
+                st.rerun()
+            elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
+                st.session_state['authenticated'] = True
+                st.session_state['role'] = 'Viewer'
+                st.query_params["role"] = "Viewer"
+                st.rerun()
+            else:
+                st.error("❌ Incorrect password. Please try again.")
+    st.stop()
+
+# --- SIDEBAR USER INFO, LOGOUT & PASSWORD MANAGEMENT ---
+with st.sidebar:
+    st.write(f"👤 Logged in as: **{st.session_state['role']}**")
+    if st.button("🚪 Logout", use_container_width=True):
+        st.session_state['authenticated'] = False
+        st.session_state['role'] = None
+        if "role" in st.query_params:
+            del st.query_params["role"]
+        st.rerun()
+    
+    if st.session_state['role'] == 'Admin':
+        st.markdown("---")
+        st.markdown("### 🔑 Password Management")
+        
+        with st.expander("Change Admin Password"):
+            new_a_pass = st.text_input("New Admin Password", type="password", key="new_admin_pass_input")
+            if st.button("Update Admin Password", use_container_width=True):
+                if new_a_pass.strip():
+                    update_db_password('admin_pass', new_a_pass.strip())
+                    st.success("Admin password updated successfully!")
+                else:
+                    st.warning("Password cannot be empty.")
+                    
+        with st.expander("Change Viewer Password"):
+            new_v_pass = st.text_input("New Viewer Password", type="password", key="new_viewer_pass_input")
+            if st.button("Update Viewer Password", use_container_width=True):
+                if new_v_pass.strip():
+                    update_db_password('viewer_pass', new_v_pass.strip())
+                    st.success("Viewer password updated successfully!")
+                else:
+                    st.warning("Password cannot be empty.")
+
 def save_records_to_db(df):
+    """
+    Saves baseline attendance to SQLite. 
+    PROTECTION RULE: Preserves existing manual overrides and batch leave conversions.
+    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     for _, r in df.iterrows():
+        norm_id = normalize_emp_id(r['EmpID'])
         c.execute('''
-            INSERT OR REPLACE INTO attendance_logs
+            INSERT INTO attendance_logs
             (emp_id, name, record_date, shift_name, parent_dept, sub_dept, year, section, dept_code, clock_in, is_present, is_leave, is_absent, is_late, excuse_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT excuse_reason FROM attendance_logs WHERE emp_id=? AND record_date=? AND shift_name=?), ''))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '')
+            ON CONFLICT(emp_id, record_date, shift_name) DO UPDATE SET
+                name = excluded.name,
+                clock_in = excluded.clock_in,
+                is_present = excluded.is_present,
+                is_absent = CASE WHEN attendance_logs.is_leave = 1 THEN 0 ELSE excluded.is_absent END,
+                is_late = excluded.is_late
         ''', (
-            str(r['EmpID']), str(r['Name']), str(r['Date']), str(r['ShiftName']),
-            str(r['ParentDept']), str(r['SubDept']), str(r['Year']), str(r['Section']),
-            str(r['DeptCode']), str(r['ClockIn']), int(r['IsPresent']), int(r['IsLeave']),
-            int(r['IsAbsent']), int(r['IsLate']), str(r['EmpID']), str(r['Date']), str(r['ShiftName'])
+            norm_id, str(r['Name']).strip(), str(r['Date']).strip(), str(r['ShiftName']).strip(),
+            str(r['ParentDept']).strip(), str(r['SubDept']).strip(), str(r['Year']).strip(), str(r['Section']).strip(),
+            str(r['DeptCode']).strip(), str(r['ClockIn']).strip(), int(r['IsPresent']),
+            int(r['IsAbsent']), int(r['IsLate'])
         ))
     conn.commit()
     conn.close()
@@ -90,12 +218,32 @@ def save_records_to_db(df):
 def convert_absence_to_leave(emp_id, dates_list, shift_name, reason):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    norm_id = normalize_emp_id(emp_id)
     for d_str in dates_list:
         c.execute('''
             UPDATE attendance_logs
             SET is_absent = 0, is_leave = 1, excuse_reason = ?
-            WHERE emp_id = ? AND record_date = ? AND shift_name = ?
-        ''', (reason, str(emp_id), str(d_str), str(shift_name)))
+            WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
+        ''', (reason, norm_id, str(d_str), str(shift_name)))
+    conn.commit()
+    conn.close()
+
+def manual_attendance_override(emp_id, date_str, shift_name, new_status, clock_in_time, reason):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    norm_id = normalize_emp_id(emp_id)
+    
+    is_pres = 1 if new_status in ['Present', 'Late'] else 0
+    is_abs = 1 if new_status == 'Absent' else 0
+    is_lea = 1 if new_status == 'Leave' else 0
+    is_lat = 1 if new_status == 'Late' else 0
+    
+    c.execute('''
+        UPDATE attendance_logs
+        SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
+        WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
+    ''', (is_pres, is_abs, is_lea, is_lat, str(clock_in_time).strip(), str(reason).strip(), norm_id, str(date_str).strip(), str(shift_name).strip()))
+    
     conn.commit()
     conn.close()
 
@@ -115,6 +263,18 @@ def parse_dept_header(dept_str):
         ('Industrial Machinery and Maintenance Technologies Department', 'Other / General')
     )
     return parent_dept, sub_dept, year_str, sec_str, clean_str
+
+def parse_flexible_date(date_val):
+    """Safely parses dates regardless of format variations."""
+    if pd.isna(date_val):
+        return datetime.now().strftime('%Y-%m-%d')
+    date_str = str(date_val).strip()
+    for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(date_str[:10], fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return datetime.now().strftime('%Y-%m-%d')
 
 def detect_shift_and_threshold(df_records):
     valid_times = [r['ClockIn'] for r in df_records if r['ClockIn']]
@@ -139,7 +299,7 @@ def detect_shift_and_threshold(df_records):
         if avg_hour >= 11:
             shift_name = 'Second Shift'
 
-    late_threshold = ('14:05' if is_friday else '12:55') if shift_name == 'Second Shift' else '08:05'
+    late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:15'
     return shift_name, late_threshold, is_friday
 
 def parse_biotime_excel(uploaded_file):
@@ -183,9 +343,12 @@ def parse_biotime_excel(uploaded_file):
         if any(kw in row_text for kw in ['statistics', 'summary', 'total record', 'page ', 'printed on']):
             continue
 
-        emp_id = row_vals[col_idx_map['id']] if col_idx_map['id'] < len(row_vals) else val0
+        emp_id = normalize_emp_id(row_vals[col_idx_map['id']] if col_idx_map['id'] < len(row_vals) else val0)
         name = row_vals[col_idx_map['name']] if col_idx_map['name'] and col_idx_map['name'] < len(row_vals) else ''
-        report_date = row_vals[col_idx_map['date']][:10] if col_idx_map['date'] and col_idx_map['date'] < len(row_vals) else datetime.now().strftime('%Y-%m-%d')
+        
+        raw_date_val = row_vals[col_idx_map['date']] if col_idx_map['date'] and col_idx_map['date'] < len(row_vals) else datetime.now()
+        report_date = parse_flexible_date(raw_date_val)
+        
         timetable = row_vals[col_idx_map['timetable']] if col_idx_map['timetable'] and col_idx_map['timetable'] < len(row_vals) else ''
 
         clock_in = ''
@@ -957,7 +1120,7 @@ def generate_excel_report(df, leave_mapping, output_path):
     wb.save(output_path)
 
 def generate_all_reports_suite(df, leave_mapping):
-    df = apply_leave_mapping(df, leave_mapping)
+    df_report_preview = apply_leave_mapping(df, leave_mapping)
     
     run_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     shift_tag = df['ShiftName'].iloc[0].replace(' ', '_').replace('(', '').replace(')', '')
@@ -965,7 +1128,7 @@ def generate_all_reports_suite(df, leave_mapping):
     os.makedirs(output_dir, exist_ok=True)
 
     save_records_to_db(df)
-    generate_interactive_master_workbook(df, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
+    generate_interactive_master_workbook(df_report_preview, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
     generate_excel_report(df, leave_mapping, os.path.join(output_dir, "Daily_Attendance_Executive_Summary.xlsx"))
 
     return os.path.abspath(output_dir)
@@ -1111,119 +1274,201 @@ def generate_fine_excel(report_data, section_code, date_range_str):
     wb.save(output)
     return output.getvalue()
 
-# --- STREAMLIT UI TABS ---
+# --- STREAMLIT UI TABS (ROLE-BASED) ---
 st.title("📊 Enterprise Attendance Suite & Disciplinary Tracking")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🚀 Process Daily Log", 
-    "🚨 Warning & Leave Exemption System", 
-    "🔍 Student Profile Search", 
-    "💰 Monthly Fine Settlement"
-])
+user_role = st.session_state['role']
 
-# --- TAB 1: DAILY LOG ---
-with tab1:
-    st.markdown("### Upload Raw BioTime Log")
-    uploaded_file = st.file_uploader("Upload ZKBioTime Excel File (.xlsx)", type=["xlsx"])
+if user_role == 'Admin':
+    tab1, tab_archive_admin, tab2, tab3, tab4 = st.tabs([
+        "🚀 Process Daily Log", 
+        "📋 Daily Records Archive", 
+        "🚨 Warning, Overrides & Leave Portal", 
+        "🔍 Student Profile Search", 
+        "💰 Monthly Fine Settlement"
+    ])
+else:
+    tab_archive, tab2, tab3, tab4 = st.tabs([
+        "📋 Daily Records Archive",
+        "🚨 Warning & Exemption View", 
+        "🔍 Student Profile Search",
+        "💰 Monthly Fine Summary (View-Only)"
+    ])
 
-    if uploaded_file is not None:
-        try:
-            df, shift_name, late_thresh = parse_biotime_excel(uploaded_file)
-            if not df.empty:
-                st.success(f"Detected **{shift_name}** | Parsed **{len(df)}** student records.")
-                
-                available_codes = set(df['DeptCode'].unique().tolist())
-                ordered_dept_codes = []
-                for parent in PARENT_ORDER:
-                    p_codes = sorted(df[df['ParentDept'] == parent]['DeptCode'].unique().tolist())
-                    ordered_dept_codes.extend(p_codes)
-                
-                for code in sorted(list(available_codes)):
-                    if code not in ordered_dept_codes:
-                        ordered_dept_codes.append(code)
+# --- TAB 1: DAILY LOG (ADMIN ONLY) ---
+if user_role == 'Admin':
+    with tab1:
+        st.markdown("### Upload Raw BioTime Log")
+        uploaded_file = st.file_uploader("Upload ZKBioTime Excel File (.xlsx)", type=["xlsx"])
 
-                st.markdown("---")
-                st.markdown("### 📝 Enter Department Leave Counts")
-                leave_mapping = {}
-                cols = st.columns(2)
-                for idx, code in enumerate(ordered_dept_codes):
-                    with cols[idx % 2]:
-                        leave_mapping[code] = st.number_input(f"[{code}] Leave Count", min_value=0, value=0, step=1, key=f"tab1_{code}")
+        if uploaded_file is not None:
+            try:
+                df, shift_name, late_thresh = parse_biotime_excel(uploaded_file)
+                if not df.empty:
+                    # Duplicate upload warning check
+                    sample_date = df['Date'].iloc[0]
+                    sample_shift = df['ShiftName'].iloc[0]
+                    existing_db = load_all_attendance_logs()
+                    if not existing_db.empty:
+                        dup_check = existing_db[(existing_db['record_date'] == sample_date) & (existing_db['shift_name'] == sample_shift)]
+                        if not dup_check.empty:
+                            st.warning(f"⚠️ **Note:** Records for date `{sample_date}` and shift `{sample_shift}` already exist in the database. Proceeding will update clock-ins while preserving your manual leaves and overrides.")
 
-                st.markdown("---")
-                if st.button("🚀 Process Log & Update History Database", type="primary", use_container_width=True):
-                    out_folder = generate_all_reports_suite(df, leave_mapping)
-                    st.session_state['processed'] = True
-                    st.session_state['out_folder'] = out_folder
-                    st.session_state['shift_title'] = df['ShiftName'].iloc[0] if not df.empty else shift_name
-                    st.session_state['report_date'] = df['Date'].iloc[0] if not df.empty else datetime.now().strftime('%Y-%m-%d')
-                    st.session_state['df_raw_saved'] = df
-                    st.session_state['leave_mapping_saved'] = leave_mapping
-                    st.success(f"Log saved to database & created folder: `{out_folder}`")
+                    st.success(f"Detected **{shift_name}** | Parsed **{len(df)}** student records.")
+                    
+                    available_codes = set(df['DeptCode'].unique().tolist())
+                    ordered_dept_codes = []
+                    for parent in PARENT_ORDER:
+                        p_codes = sorted(df[df['ParentDept'] == parent]['DeptCode'].unique().tolist())
+                        ordered_dept_codes.extend(p_codes)
+                    
+                    for code in sorted(list(available_codes)):
+                        if code not in ordered_dept_codes:
+                            ordered_dept_codes.append(code)
 
-                if st.session_state.get('processed', False):
-                    st.markdown("### 🖨️ Daily Summary Preview")
-                    report_date = st.session_state.get('report_date', '')
-                    shift_title = st.session_state.get('shift_title', '')
-                    out_folder = st.session_state.get('out_folder', 'Attendance_Records')
-                    saved_df = st.session_state.get('df_raw_saved', df)
-                    saved_leaves = st.session_state.get('leave_mapping_saved', leave_mapping)
+                    st.markdown("---")
+                    st.markdown("### 📝 Enter Department Leave Counts")
+                    leave_mapping = {}
+                    cols = st.columns(2)
+                    for idx, code in enumerate(ordered_dept_codes):
+                        with cols[idx % 2]:
+                            leave_mapping[code] = st.number_input(f"[{code}] Leave Count", min_value=0, value=0, step=1, key=f"tab1_{code}")
 
-                    st.info(f"📁 **Active Run Folder:** `{out_folder}`")
-                    html_report = build_html_report(saved_df, saved_leaves, shift_title, report_date)
-                    st.components.v1.html(html_report, height=450, scrolling=True)
+                    st.markdown("---")
+                    if st.button("🚀 Process Log & Update History Database", type="primary", use_container_width=True):
+                        out_folder = generate_all_reports_suite(df, leave_mapping)
+                        st.session_state['processed'] = True
+                        st.session_state['out_folder'] = out_folder
+                        st.session_state['shift_title'] = df['ShiftName'].iloc[0] if not df.empty else shift_name
+                        st.session_state['report_date'] = df['Date'].iloc[0] if not df.empty else datetime.now().strftime('%Y-%m-%d')
+                        st.session_state['df_raw_saved'] = df
+                        st.session_state['leave_mapping_saved'] = leave_mapping
+                        st.success(f"Log saved to database & created folder: `{out_folder}`")
 
-                    col_actions_1, col_actions_2, col_actions_3 = st.columns(3)
-                    with col_actions_1:
-                        exec_file = os.path.join(out_folder, "Daily_Attendance_Executive_Summary.xlsx")
-                        if os.path.exists(exec_file):
-                            with open(exec_file, "rb") as f:
-                                st.download_button(
-                                    label="📥 Download Executive Workbook",
-                                    data=f,
-                                    file_name=os.path.basename(exec_file),
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
+                    if st.session_state.get('processed', False):
+                        st.markdown("### 🖨️ Daily Summary Preview")
+                        report_date = st.session_state.get('report_date', '')
+                        shift_title = st.session_state.get('shift_title', '')
+                        out_folder = st.session_state.get('out_folder', 'Attendance_Records')
+                        saved_df = st.session_state.get('df_raw_saved', df)
+                        saved_leaves = st.session_state.get('leave_mapping_saved', leave_mapping)
 
-                    with col_actions_2:
-                        if st.button("📂 Open This Run's Folder", use_container_width=True):
-                            try:
-                                os.startfile(out_folder)
-                                st.toast("Opened folder successfully!")
-                            except Exception as ex:
-                                st.error(f"Could not open folder automatically: {ex}")
+                        st.info(f"📁 **Active Run Folder:** `{out_folder}`")
+                        html_report = build_html_report(saved_df, saved_leaves, shift_title, report_date)
+                        st.components.v1.html(html_report, height=450, scrolling=True)
 
-                    with col_actions_3:
-                        print_script = (
-                            "<script>"
-                            "function printReport() {"
-                            "    var myWindow = window.open('', '_blank', 'width=800,height=600');"
-                            f"    myWindow.document.write(`{html_report}`);"
-                            "    myWindow.document.close();"
-                            "    myWindow.focus();"
-                            "    setTimeout(function() { myWindow.print(); myWindow.close(); }, 500);"
-                            "}"
-                            "</script>"
-                            "<button onclick=\"printReport()\" style=\""
-                            "    width: 100%; background-color: #8B5CF6; color: white; padding: 10px 15px;"
-                            "    border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer;"
-                            "\">🖨️ Print One-Page Report</button>"
-                        )
-                        st.components.v1.html(print_script, height=60)
+                        col_actions_1, col_actions_2, col_actions_3 = st.columns(3)
+                        with col_actions_1:
+                            exec_file = os.path.join(out_folder, "Daily_Attendance_Executive_Summary.xlsx")
+                            if os.path.exists(exec_file):
+                                with open(exec_file, "rb") as f:
+                                    st.download_button(
+                                        label="📥 Download Executive Workbook",
+                                        data=f,
+                                        file_name=os.path.basename(exec_file),
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        use_container_width=True
+                                    )
 
-        except Exception as e:
-            st.error(f"Error processing file: {e}")
+                        with col_actions_2:
+                            if st.button("📂 Open This Run's Folder", use_container_width=True):
+                                try:
+                                    os.startfile(out_folder)
+                                    st.toast("Opened folder successfully!")
+                                except Exception as ex:
+                                    st.error(f"Could not open folder automatically: {ex}")
 
-# --- TAB 2: WARNINGS & LEAVE EXEMPTION ---
-with tab2:
-    st.markdown("### 🚨 Disciplinary Warning & Leave Exemption Portal")
-    conn = sqlite3.connect(DB_FILE)
-    df_db = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
-    conn.close()
+                        with col_actions_3:
+                            print_script = (
+                                "<script>"
+                                "function printReport() {"
+                                "    var myWindow = window.open('', '_blank', 'width=800,height=600');"
+                                f"    myWindow.document.write(`{html_report}`);"
+                                "    myWindow.document.close();"
+                                "    myWindow.focus();"
+                                "    setTimeout(function() {{ myWindow.print(); myWindow.close(); }}, 500);"
+                                "}"
+                                "</script>"
+                                "<button onclick=\"printReport()\" style=\""
+                                "    width: 100%; background-color: #8B5CF6; color: white; padding: 10px 15px;"
+                                "    border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer;"
+                                "\">🖨️ Print One-Page Report</button>"
+                            )
+                            st.components.v1.html(print_script, height=60)
+
+            except Exception as e:
+                st.error(f"Error processing file: {e}")
+
+# --- TAB ARCHIVE: ADMIN & VIEWER DAILY RECORDS ARCHIVE ---
+target_archive_tab = tab_archive_admin if user_role == 'Admin' else tab_archive
+
+with target_archive_tab:
+    st.markdown("### 📋 Daily Records & Historical Attendance Archive")
+    st.info("💡 Filter, review, and inspect historical attendance logs across dates, shifts, and sections.")
+
+    df_db = load_all_attendance_logs()
 
     if df_db.empty:
-        st.info("No attendance records in history database yet. Process a daily log first!")
+        st.warning("No daily records found in the database yet.")
+    else:
+        all_db_dates = pd.to_datetime(df_db['record_date']).dt.date.tolist()
+        min_avail_date = min(all_db_dates)
+        max_avail_date = max(all_db_dates)
+
+        c_d1, c_d2 = st.columns(2)
+        with c_d1:
+            start_archive_d = st.date_input("Start Date", value=min_avail_date, min_value=min_avail_date, max_value=max_avail_date, key=f"{user_role}_archive_start")
+        with c_d2:
+            end_archive_d = st.date_input("End Date", value=max_avail_date, min_value=min_avail_date, max_value=max_avail_date, key=f"{user_role}_archive_end")
+
+        start_arch_str = start_archive_d.strftime('%Y-%m-%d')
+        end_arch_str = end_archive_d.strftime('%Y-%m-%d')
+
+        date_range_logs = df_db[
+            (df_db['record_date'] >= start_arch_str) & 
+            (df_db['record_date'] <= end_arch_str)
+        ]
+
+        available_shifts = sorted(date_range_logs['shift_name'].unique().tolist()) if not date_range_logs.empty else []
+        available_sections = sorted(date_range_logs['dept_code'].unique().tolist()) if not date_range_logs.empty else []
+
+        c_sh, c_sec = st.columns(2)
+        with c_sh:
+            selected_shifts = st.multiselect("Filter Shift(s):", available_shifts, default=available_shifts, key=f"{user_role}_archive_shifts")
+        with c_sec:
+            selected_sections = st.multiselect("Filter Section(s):", available_sections, default=available_sections, key=f"{user_role}_archive_sections")
+
+        if date_range_logs.empty or not selected_shifts or not selected_sections:
+            st.warning("No attendance records match the selected date range, shift, or section filters.")
+        else:
+            filtered_logs = date_range_logs[
+                date_range_logs['shift_name'].isin(selected_shifts) & 
+                date_range_logs['dept_code'].isin(selected_sections)
+            ]
+
+            st.markdown(f"#### Summary for Date Range: `{start_arch_str}` to `{end_arch_str}`")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Total Days Logged", filtered_logs['record_date'].nunique())
+            m2.metric("Total Logs", len(filtered_logs))
+            m3.metric("Total Present", int(filtered_logs['is_present'].sum()))
+            m4.metric("Total Absent", int(filtered_logs['is_absent'].sum()))
+            m5.metric("Total Leave", int(filtered_logs['is_leave'].sum()))
+
+            st.markdown("---")
+            st.markdown("#### Detailed Attendance Logs")
+            st.dataframe(filtered_logs[['record_date', 'shift_name', 'emp_id', 'name', 'parent_dept', 'sub_dept', 'dept_code', 'clock_in', 'is_present', 'is_absent', 'is_leave', 'is_late', 'excuse_reason']], use_container_width=True)
+
+# --- TAB 2: WARNINGS & MANUAL OVERRIDES / LEAVE PORTAL ---
+with tab2:
+    if user_role == 'Admin':
+        st.markdown("### 🚨 Disciplinary Warning & Manual Attendance Override Portal")
+    else:
+        st.markdown("### 🚨 Disciplinary Warning & Exemption View (Read-Only)")
+
+    df_db = load_all_attendance_logs()
+
+    if df_db.empty:
+        st.info("No attendance records in history database yet.")
     else:
         abs_summary = df_db.groupby(['emp_id', 'name', 'dept_code', 'sub_dept']).agg(
             Total_Days=('record_date', 'nunique'),
@@ -1241,7 +1486,7 @@ with tab2:
         st.markdown("---")
         st.markdown("#### 🚩 Personnel Requiring Action")
 
-        warning_filter = st.radio("Filter Stage:", ["All Warnings", "1st Warning (4-7 Absences)", "2nd Warning (8-11 Absences)", "Withdrawal Notice (12+ Absences)"])
+        warning_filter = st.radio("Filter Stage:", ["All Warnings", "1st Warning (4-7 Absences)", "2nd Warning (8-11 Absences)", "Withdrawal Notice (12+ Absences)"], key="warning_radio_viewer" if user_role == 'Viewer' else "warning_radio_admin")
         
         if warning_filter == "1st Warning (4-7 Absences)":
             flagged = abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['Total_Absent'] < 8)]
@@ -1263,96 +1508,139 @@ with tab2:
             processed_data = output.getvalue()
 
             st.download_button(
-                label="📥 Export Filtered Warning List to Excel (For Department Verification)",
+                label="📥 Export Filtered Warning List to Excel",
                 data=processed_data,
                 file_name=export_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
 
-        st.markdown("---")
-        st.markdown("### 🏥 Convert Absence to Approved/Medical Leave")
-        st.caption("Select a flagged student to view their absent dates and convert medical proofs into excused leaves.")
+        # ADMIN ONLY WRITE SECTIONS
+        if user_role == 'Admin':
+            st.markdown("---")
+            st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
+            st.caption("Use this section to record direct leaves (e.g. reported by Class Rep) or mark presence for power outages.")
 
-        flagged_emp_list = sorted_flagged['emp_id'].tolist() if not sorted_flagged.empty else sorted(df_db[df_db['is_absent'] == 1]['emp_id'].unique().tolist())
-        
-        if flagged_emp_list:
-            selected_exemption_emp = st.selectbox("Select Student / Employee ID for Exemption:", flagged_emp_list, key="exempt_select")
+            all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
+            student_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_students.iterrows()]
+            
+            selected_student_str = st.selectbox("Select Student:", student_options, key="manual_override_student")
+            
+            if selected_student_str:
+                sel_emp_id = normalize_emp_id(selected_student_str.split(" - ")[0])
+                student_records = df_db[df_db['emp_id'] == sel_emp_id].sort_values(by='record_date', ascending=False)
 
-            if selected_exemption_emp:
-                emp_absent_records = df_db[(df_db['emp_id'] == selected_exemption_emp) & (df_db['is_absent'] == 1)].sort_values(by='record_date')
-                emp_info = df_db[df_db['emp_id'] == selected_exemption_emp].iloc[0]
-
-                st.write(f"**Student Name:** {emp_info['name']} | **Dept:** {emp_info['dept_code']}")
-
-                if emp_absent_records.empty:
-                    st.success("This student has no recorded unexcused absences!")
-                else:
-                    absent_dates_with_shifts = emp_absent_records[['record_date', 'shift_name']].drop_duplicates()
-                    date_shift_options = [f"{row['record_date']} ({row['shift_name']})" for _, row in absent_dates_with_shifts.iterrows()]
+                if not student_records.empty:
+                    st.markdown("##### Change Existing Log Entry")
+                    record_dates_shifts = student_records[['record_date', 'shift_name', 'is_present', 'is_absent', 'is_leave', 'clock_in']].copy()
                     
-                    selected_options = st.multiselect("Select Date & Shift to Excuse / Convert to Leave:", date_shift_options)
-                    reason_input = st.text_input("Approval Reason / Medical Certificate Details:", value="Medical Certificate Provided")
+                    date_shift_opts = [f"{r['record_date']} | {r['shift_name']} (Current: {'Present' if r['is_present']==1 else ('Leave' if r['is_leave']==1 else 'Absent')})" for _, r in record_dates_shifts.iterrows()]
+                    selected_date_opt = st.selectbox("Select Date & Shift Record to Update:", date_shift_opts)
+                    
+                    target_date = selected_date_opt.split(" | ")[0].strip()
+                    target_shift = selected_date_opt.split(" | ")[1].split(" (")[0].strip()
+                    
+                    col_ov1, col_ov2, col_ov3 = st.columns(3)
+                    with col_ov1:
+                        target_status = st.selectbox("Set New Status:", ["Present", "Leave", "Absent", "Late"], key="target_status")
+                    with col_ov2:
+                        target_time = st.text_input("Clock-In Time (HH:MM):", value="08:00" if target_status in ["Present", "Late"] else "", key="target_time")
+                    with col_ov3:
+                        override_reason = st.text_input("Reason / Note:", value="Manual Correction" if target_status == "Present" else "Reported by Class Rep", key="target_reason")
 
-                    if st.button("✅ Convert Selected Dates to Excused Leave", type="primary"):
-                        if not selected_options:
-                            st.warning("Please select at least one date/shift to convert.")
-                        else:
-                            for opt in selected_options:
-                                d_str = opt.split(" (")[0]
-                                s_name = opt.split(" (")[1].rstrip(")")
-                                convert_absence_to_leave(selected_exemption_emp, [d_str], s_name, reason_input)
-                            st.success(f"Successfully converted selected record(s) to Approved Leave!")
-                            st.rerun()
-        else:
-            st.info("No students currently have unexcused absences.")
+                    if st.button("💾 Apply Manual Override", type="primary", use_container_width=True):
+                        manual_attendance_override(sel_emp_id, target_date, target_shift, target_status, target_time, override_reason)
+                        st.success(f"Successfully updated record for Student {sel_emp_id} on {target_date} ({target_shift}) to {target_status}!")
+                        st.rerun()
 
-# --- TAB 3: STUDENT SEARCH ---
+            st.markdown("---")
+            st.markdown("### 🏥 Batch Convert Absence to Approved/Medical Leave")
+            st.caption("Select a flagged student to view their absent dates and convert medical proofs into excused leaves.")
+
+            flagged_emp_list = sorted_flagged['emp_id'].tolist() if not sorted_flagged.empty else sorted(df_db[df_db['is_absent'] == 1]['emp_id'].unique().tolist())
+            
+            if flagged_emp_list:
+                selected_exemption_emp = st.selectbox("Select Student / Employee ID for Exemption:", flagged_emp_list, key="exempt_select")
+
+                if selected_exemption_emp:
+                    norm_exempt_id = normalize_emp_id(selected_exemption_emp)
+                    emp_absent_records = df_db[(df_db['emp_id'] == norm_exempt_id) & (df_db['is_absent'] == 1)].sort_values(by='record_date')
+                    emp_info = df_db[df_db['emp_id'] == norm_exempt_id].iloc[0]
+
+                    st.write(f"**Student Name:** {emp_info['name']} | **Dept:** {emp_info['dept_code']}")
+
+                    if emp_absent_records.empty:
+                        st.success("This student has no recorded unexcused absences!")
+                    else:
+                        absent_dates_with_shifts = emp_absent_records[['record_date', 'shift_name']].drop_duplicates()
+                        date_shift_options = [f"{row['record_date']} ({row['shift_name']})" for _, row in absent_dates_with_shifts.iterrows()]
+                        
+                        selected_options = st.multiselect("Select Date & Shift to Excuse / Convert to Leave:", date_shift_options)
+                        reason_input = st.text_input("Approval Reason / Medical Certificate Details:", value="Medical Certificate Provided")
+
+                        if st.button("✅ Convert Selected Dates to Excused Leave", type="primary"):
+                            if not selected_options:
+                                st.warning("Please select at least one date/shift to convert.")
+                            else:
+                                for opt in selected_options:
+                                    d_str = opt.split(" (")[0].strip()
+                                    s_name = opt.split(" (")[1].rstrip(")").strip()
+                                    convert_absence_to_leave(norm_exempt_id, [d_str], s_name, reason_input)
+                                st.success(f"Successfully converted selected record(s) to Approved Leave!")
+                                st.rerun()
+            else:
+                st.info("No students currently have unexcused absences.")
+
+# --- TAB 3: STUDENT PROFILE SEARCH ---
 with tab3:
     st.markdown("### 🔍 Individual Student Attendance Performance Profile")
-    conn = sqlite3.connect(DB_FILE)
-    df_db = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
-    conn.close()
+    
+    df_db = load_all_attendance_logs()
 
     if not df_db.empty:
         emp_list = sorted(df_db['emp_id'].unique().tolist())
-        selected_emp = st.selectbox("Select Employee / Student ID:", emp_list)
+        
+        selected_emp = st.selectbox("Select Employee / Student ID:", emp_list, key="search_emp_select")
 
         if selected_emp:
-            emp_records = df_db[df_db['emp_id'] == selected_emp].sort_values(by=['record_date', 'shift_name'])
-            emp_name = emp_records['name'].iloc[0]
-            emp_dept = emp_records['dept_code'].iloc[0]
-
-            tot_days = len(emp_records)
-            tot_pres = emp_records['is_present'].sum()
-            tot_abs = emp_records['is_absent'].sum()
-            tot_late = emp_records['is_late'].sum()
-            tot_leave = emp_records['is_leave'].sum()
-
-            pct = (tot_pres / max(tot_days, 1)) * 100
-
-            st.subheader(f"Profile: {emp_name} ({selected_emp}) - {emp_dept}")
+            norm_sel_emp = normalize_emp_id(selected_emp)
+            emp_records = df_db[df_db['emp_id'] == norm_sel_emp].sort_values(by=['record_date', 'shift_name'])
             
-            p1, p2, p3, p4, p5 = st.columns(5)
-            p1.metric("Attendance %", f"{pct:.1f}%")
-            p2.metric("Total Present", tot_pres)
-            p3.metric("Total Absent", tot_abs)
-            p4.metric("Total Late", tot_late)
-            p5.metric("Total Leave", tot_leave)
+            if not emp_records.empty:
+                emp_name = emp_records['name'].iloc[0]
+                emp_dept = emp_records['dept_code'].iloc[0]
 
-            st.markdown("#### Detailed Clock-In History Log")
-            if 'excuse_reason' not in emp_records.columns:
-                emp_records['excuse_reason'] = ''
-            st.dataframe(emp_records[['record_date', 'shift_name', 'clock_in', 'is_present', 'is_absent', 'is_late', 'is_leave', 'excuse_reason']], use_container_width=True)
+                tot_days = len(emp_records)
+                tot_pres = int(emp_records['is_present'].sum())
+                tot_abs = int(emp_records['is_absent'].sum())
+                tot_late = int(emp_records['is_late'].sum())
+                tot_leave = int(emp_records['is_leave'].sum())
+
+                pct = (tot_pres / max(tot_days, 1)) * 100
+
+                st.subheader(f"Profile: {emp_name} ({norm_sel_emp}) - {emp_dept}")
+                
+                p1, p2, p3, p4, p5 = st.columns(5)
+                p1.metric("Attendance %", f"{pct:.1f}%")
+                p2.metric("Total Present", tot_pres)
+                p3.metric("Total Absent", tot_abs)
+                p4.metric("Total Late", tot_late)
+                p5.metric("Total Leave", tot_leave)
+
+                st.markdown("#### Detailed Clock-In History Log")
+                if 'excuse_reason' not in emp_records.columns:
+                    emp_records['excuse_reason'] = ''
+                    
+                display_cols = ['record_date', 'shift_name', 'clock_in', 'is_present', 'is_absent', 'is_late', 'is_leave', 'excuse_reason']
+                st.dataframe(emp_records[display_cols], use_container_width=True)
 
 # --- TAB 4: MONTHLY FINE SETTLEMENT ENGINE ---
 with tab4:
     st.markdown("### 💰 Monthly Fine Settlement & Disciplinary Billing Engine")
-    st.caption("Generate automated section-wise monthly fine sheets (Default Cycle: 20th of previous month to 19th of current month).")
+    if user_role == 'Viewer':
+        st.info("👀 **Viewer Mode:** You are viewing calculated fine summaries in read-only mode. Edits and recalculations are restricted to Admin.")
 
-    conn = sqlite3.connect(DB_FILE)
-    df_db = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
-    conn.close()
+    df_db = load_all_attendance_logs()
 
     if df_db.empty:
         st.info("No logs in database. Process daily attendance logs first!")
@@ -1361,7 +1649,7 @@ with tab4:
         
         sections_list = sorted(df_db['dept_code'].unique().tolist())
         with c_sec:
-            selected_section = st.selectbox("Select Class / Section:", sections_list, key="fine_sec_select")
+            selected_section = st.selectbox("Select Class / Section:", sections_list, key="fine_sec_select_viewer" if user_role == 'Viewer' else "fine_sec_select")
             
         today = date.today()
         if today.day >= 20:
@@ -1378,9 +1666,9 @@ with tab4:
             default_end = date(today.year, today.month, 19)
 
         with c_start:
-            start_d = st.date_input("Start Date (Cycle)", default_start)
+            start_d = st.date_input("Start Date (Cycle)", default_start, key="start_d_view" if user_role == 'Viewer' else "start_d_admin")
         with c_end:
-            end_d = st.date_input("End Date (Cycle)", default_end)
+            end_d = st.date_input("End Date (Cycle)", default_end, key="end_d_view" if user_role == 'Viewer' else "end_d_admin")
 
         start_str = start_d.strftime('%Y-%m-%d')
         end_str = end_d.strftime('%Y-%m-%d')
@@ -1412,213 +1700,251 @@ with tab4:
             st.warning(f"No attendance logs found for section **{selected_section}** between {start_str} and {end_str}.")
         else:
             st.markdown(f"#### 📋 Fine Settlement Roster — Section `{selected_section}`")
-            st.info("💡 Enter your adjustments below, then click **Calculate & Refresh Totals** to update all amounts instantly.")
 
-            with st.form(key=f"fine_form_{selected_section}"):
-                grid_hdr = st.columns([1.1, 1.8, 0.6, 0.6, 0.9, 1.1, 1.2, 1.2, 1.3, 1.4, 2.0])
-                headers = ["ID", "Name", "Abs", "Late", "In-Living?", "Auto Fine", "Disc.", "Waiver", "Total (Rs.)", "Warnings", "Remarks"]
-                for idx, h in enumerate(headers):
-                    grid_hdr[idx].markdown(f"**{h}**")
+            if user_role == 'Admin':
+                st.info("💡 Enter your adjustments below, then click **Calculate & Refresh Totals** to update all amounts instantly.")
 
-                form_inputs = []
+                with st.form(key=f"fine_form_{selected_section}"):
+                    grid_hdr = st.columns([1.1, 1.8, 0.6, 0.6, 0.9, 1.1, 1.2, 1.2, 1.3, 1.4, 2.0])
+                    headers = ["ID", "Name", "Abs", "Late", "In-Living?", "Auto Fine", "Disc.", "Waiver", "Total (Rs.)", "Warnings", "Remarks"]
+                    for idx, h in enumerate(headers):
+                        grid_hdr[idx].markdown(f"**{h}**")
 
-                for idx, (_, st_row) in enumerate(unique_students.iterrows()):
-                    e_id = str(st_row['emp_id'])
-                    e_name = str(st_row['name'])
-                    
-                    emp_period_df = sec_logs[sec_logs['emp_id'] == e_id]
-                    
-                    r_cols = st.columns([1.1, 1.8, 0.6, 0.6, 0.9, 1.1, 1.2, 1.2, 1.3, 1.4, 2.0])
-                    
-                    r_cols[0].write(e_id)
-                    r_cols[1].write(e_name)
-                    
-                    k_inliving = f"inliving_{selected_section}_{e_id}_{idx}"
-                    k_disc = f"disc_{selected_section}_{e_id}_{idx}"
-                    k_waiver = f"waiver_{selected_section}_{e_id}_{idx}"
-                    k_rem = f"rem_{selected_section}_{e_id}_{idx}"
-                    
-                    is_inliving = r_cols[4].checkbox("", key=k_inliving)
-                    
-                    abs_cnt, late_cnt, absent_fine, late_fine = calculate_student_fine_breakdown(emp_period_df, is_inliving)
-                    auto_fine = absent_fine + late_fine
-                    
-                    r_cols[2].write(abs_cnt)
-                    r_cols[3].write(late_cnt)
-                    r_cols[5].write(f"Rs. {auto_fine}")
-                    
-                    disc_fine = r_cols[6].number_input("", min_value=0, value=0, step=50, key=k_disc, label_visibility="collapsed")
-                    waiver = r_cols[7].number_input("", min_value=0, value=0, step=50, key=k_waiver, label_visibility="collapsed")
-                    
-                    prov_total = max(0, auto_fine + disc_fine - waiver)
-                    r_cols[8].markdown(f"**Rs. {prov_total}**")
-                    
-                    warn_status = warning_map.get(e_id, "Normal")
-                    if warn_status == "Withdrawal Notice":
-                        r_cols[9].error("Withdrawal")
-                    elif warn_status == "2nd Warning":
-                        r_cols[9].warning("2nd Warning")
-                    elif warn_status == "1st Warning":
-                        r_cols[9].info("1st Warning")
-                    else:
-                        r_cols[9].write("Normal")
+                    form_inputs = []
 
-                    remarks = r_cols[10].text_input("", placeholder="Notes...", key=k_rem, label_visibility="collapsed")
+                    for idx, (_, st_row) in enumerate(unique_students.iterrows()):
+                        e_id = normalize_emp_id(st_row['emp_id'])
+                        e_name = str(st_row['name']).strip()
+                        
+                        emp_period_df = sec_logs[sec_logs['emp_id'] == e_id]
+                        
+                        r_cols = st.columns([1.1, 1.8, 0.6, 0.6, 0.9, 1.1, 1.2, 1.2, 1.3, 1.4, 2.0])
+                        
+                        r_cols[0].write(e_id)
+                        r_cols[1].write(e_name)
+                        
+                        k_inliving = f"inliving_{selected_section}_{e_id}_{idx}"
+                        k_disc = f"disc_{selected_section}_{e_id}_{idx}"
+                        k_waiver = f"waiver_{selected_section}_{e_id}_{idx}"
+                        k_rem = f"rem_{selected_section}_{e_id}_{idx}"
+                        
+                        is_inliving = r_cols[4].checkbox("", key=k_inliving)
+                        
+                        abs_cnt, late_cnt, absent_fine, late_fine = calculate_student_fine_breakdown(emp_period_df, is_inliving)
+                        auto_fine = absent_fine + late_fine
+                        
+                        r_cols[2].write(abs_cnt)
+                        r_cols[3].write(late_cnt)
+                        r_cols[5].write(f"Rs. {auto_fine}")
+                        
+                        disc_fine = r_cols[6].number_input("", min_value=0, value=0, step=50, key=k_disc, label_visibility="collapsed")
+                        waiver = r_cols[7].number_input("", min_value=0, value=0, step=50, key=k_waiver, label_visibility="collapsed")
+                        
+                        prov_total = max(0, auto_fine + disc_fine - waiver)
+                        r_cols[8].markdown(f"**Rs. {prov_total}**")
+                        
+                        warn_status = warning_map.get(e_id, "Normal")
+                        if warn_status == "Withdrawal Notice":
+                            r_cols[9].error("Withdrawal")
+                        elif warn_status == "2nd Warning":
+                            r_cols[9].warning("2nd Warning")
+                        elif warn_status == "1st Warning":
+                            r_cols[9].info("1st Warning")
+                        else:
+                            r_cols[9].write("Normal")
 
-                    form_inputs.append({
+                        remarks = r_cols[10].text_input("", placeholder="Notes...", key=k_rem, label_visibility="collapsed")
+
+                        form_inputs.append({
+                            'ID': e_id,
+                            'Name': e_name,
+                            'Abs': abs_cnt,
+                            'Late': late_cnt,
+                            'Auto_Fine': auto_fine,
+                            'Disc_Fine': disc_fine,
+                            'Waiver': waiver,
+                            'Warnings': warn_status,
+                            'Remarks': remarks
+                        })
+
+                    st.markdown("---")
+                    submitted = st.form_submit_button("🧮 Calculate & Refresh Totals", type="primary", use_container_width=True)
+
+                report_items = []
+                tot_abs_sum = 0
+                tot_late_sum = 0
+                tot_auto_fine_sum = 0
+                tot_disc_fine_sum = 0
+                tot_waiver_sum = 0
+                tot_grand_sum = 0
+
+                for item in form_inputs:
+                    e_id = item['ID']
+                    auto_fine = item['Auto_Fine']
+                    disc_fine = item['Disc_Fine']
+                    waiver = item['Waiver']
+                    
+                    total_fine = max(0, auto_fine + disc_fine - waiver)
+
+                    tot_abs_sum += item['Abs']
+                    tot_late_sum += item['Late']
+                    tot_auto_fine_sum += auto_fine
+                    tot_disc_fine_sum += disc_fine
+                    tot_waiver_sum += waiver
+                    tot_grand_sum += total_fine
+
+                    report_items.append({
                         'ID': e_id,
-                        'Name': e_name,
-                        'Abs': abs_cnt,
-                        'Late': late_cnt,
+                        'Name': item['Name'],
+                        'Absentees': item['Abs'],
+                        'Late': item['Late'],
                         'Auto_Fine': auto_fine,
                         'Disc_Fine': disc_fine,
                         'Waiver': waiver,
-                        'Warnings': warn_status,
-                        'Remarks': remarks
+                        'Total': total_fine,
+                        'Warnings': item['Warnings'],
+                        'Remarks': item['Remarks']
                     })
 
+                st.markdown("### 🧮 Section Grand Totals")
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+                m1.metric("Total Abs", tot_abs_sum)
+                m2.metric("Total Late", tot_late_sum)
+                m3.metric("Auto Fines", f"Rs. {tot_auto_fine_sum:,}")
+                m4.metric("Disc. Fines", f"Rs. {tot_disc_fine_sum:,}")
+                m5.metric("Total Waivers", f"Rs. {tot_waiver_sum:,}")
+                m6.metric("GRAND TOTAL", f"Rs. {tot_grand_sum:,}")
+
                 st.markdown("---")
-                submitted = st.form_submit_button("🧮 Calculate & Refresh Totals", type="primary", use_container_width=True)
-
-            report_items = []
-            tot_abs_sum = 0
-            tot_late_sum = 0
-            tot_auto_fine_sum = 0
-            tot_disc_fine_sum = 0
-            tot_waiver_sum = 0
-            tot_grand_sum = 0
-
-            for item in form_inputs:
-                e_id = item['ID']
-                auto_fine = item['Auto_Fine']
-                disc_fine = item['Disc_Fine']
-                waiver = item['Waiver']
                 
-                total_fine = max(0, auto_fine + disc_fine - waiver)
+                col_exp1, col_exp2 = st.columns(2)
+                
+                with col_exp1:
+                    excel_bytes = generate_fine_excel(report_items, selected_section, cycle_label)
+                    st.download_button(
+                        label=f"📥 Download Printable Excel Fine Sheet ({selected_section})",
+                        data=excel_bytes,
+                        file_name=f"Fine_Settlement_{selected_section}_{end_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
 
-                tot_abs_sum += item['Abs']
-                tot_late_sum += item['Late']
-                tot_auto_fine_sum += auto_fine
-                tot_disc_fine_sum += disc_fine
-                tot_waiver_sum += waiver
-                tot_grand_sum += total_fine
+                with col_exp2:
+                    fine_rows_html = ""
+                    for item in report_items:
+                        fine_rows_html += f"""
+                        <tr>
+                            <td>{item['ID']}</td>
+                            <td style="text-align: left;">{item['Name']}</td>
+                            <td>{item['Absentees']}</td>
+                            <td>{item['Late']}</td>
+                            <td>Rs. {item['Auto_Fine']}</td>
+                            <td>Rs. {item['Disc_Fine']}</td>
+                            <td>Rs. {item['Total']}</td>
+                            <td>{item['Warnings']}</td>
+                            <td style="text-align: left;">{item['Remarks']}</td>
+                        </tr>
+                        """
 
-                report_items.append({
-                    'ID': e_id,
-                    'Name': item['Name'],
-                    'Absentees': item['Abs'],
-                    'Late': item['Late'],
-                    'Auto_Fine': auto_fine,
-                    'Disc_Fine': disc_fine,
-                    'Waiver': waiver,
-                    'Total': total_fine,
-                    'Warnings': item['Warnings'],
-                    'Remarks': item['Remarks']
-                })
-
-            st.markdown("### 🧮 Section Grand Totals")
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("Total Abs", tot_abs_sum)
-            m2.metric("Total Late", tot_late_sum)
-            m3.metric("Auto Fines", f"Rs. {tot_auto_fine_sum:,}")
-            m4.metric("Disc. Fines", f"Rs. {tot_disc_fine_sum:,}")
-            m5.metric("Total Waivers", f"Rs. {tot_waiver_sum:,}")
-            m6.metric("GRAND TOTAL", f"Rs. {tot_grand_sum:,}")
-
-            st.markdown("---")
-            
-            col_exp1, col_exp2 = st.columns(2)
-            
-            with col_exp1:
-                excel_bytes = generate_fine_excel(report_items, selected_section, cycle_label)
-                st.download_button(
-                    label=f"📥 Download Printable Excel Fine Sheet ({selected_section})",
-                    data=excel_bytes,
-                    file_name=f"Fine_Settlement_{selected_section}_{end_str}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    type="primary"
-                )
-
-            with col_exp2:
-                fine_rows_html = ""
-                for item in report_items:
-                    fine_rows_html += f"""
-                    <tr>
-                        <td>{item['ID']}</td>
-                        <td style="text-align: left;">{item['Name']}</td>
-                        <td>{item['Absentees']}</td>
-                        <td>{item['Late']}</td>
-                        <td>Rs. {item['Auto_Fine']}</td>
-                        <td>Rs. {item['Disc_Fine']}</td>
-                        <td>Rs. {item['Total']}</td>
-                        <td>{item['Warnings']}</td>
-                        <td style="text-align: left;">{item['Remarks']}</td>
-                    </tr>
+                    print_html = f"""
+                    <html>
+                    <head>
+                        <style>
+                            @page {{ size: A4 portrait; margin: 4mm; }}
+                            body {{ font-family: 'Century Gothic', sans-serif; color: black; background: white; margin: 0; padding: 0; }}
+                            h2 {{ text-align: center; margin: 0 0 2px 0; font-size: 13pt; color: #1E293B; }}
+                            .sub {{ text-align: center; font-size: 9pt; font-weight: bold; margin-bottom: 6px; color: #475569; }}
+                            table {{ width: 100%; border-collapse: collapse; page-break-inside: auto; }}
+                            tr {{ page-break-inside: avoid; page-break-after: auto; }}
+                            th, td {{ border: 1px solid #64748B; padding: 3px 3px; text-align: center; font-size: 8pt; white-space: nowrap; }}
+                            th {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
+                            .grand {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
+                        </style>
+                    </head>
+                    <body>
+                        <h2>MONTHLY FINE SETTLEMENT SHEET — SECTION: {selected_section}</h2>
+                        <div class="sub">Billing Cycle: {cycle_label}</div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Student ID</th>
+                                    <th>Student Name</th>
+                                    <th>Abs</th>
+                                    <th>Late</th>
+                                    <th>Auto Fine</th>
+                                    <th>Disc.</th>
+                                    <th>Total (Rs.)</th>
+                                    <th>Warnings</th>
+                                    <th>Remarks</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {fine_rows_html}
+                                <tr class="grand">
+                                    <td colspan="2">GRAND TOTAL</td>
+                                    <td>{tot_abs_sum}</td>
+                                    <td>{tot_late_sum}</td>
+                                    <td>Rs. {tot_auto_fine_sum:,}</td>
+                                    <td>Rs. {tot_disc_fine_sum:,}</td>
+                                    <td>Rs. {tot_grand_sum:,}</td>
+                                    <td colspan="2"></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </body>
+                    </html>
                     """
 
-                print_html = f"""
-                <html>
-                <head>
-                    <style>
-                        @page {{ size: A4 portrait; margin: 4mm; }}
-                        body {{ font-family: 'Century Gothic', sans-serif; color: black; background: white; margin: 0; padding: 0; }}
-                        h2 {{ text-align: center; margin: 0 0 2px 0; font-size: 13pt; color: #1E293B; }}
-                        .sub {{ text-align: center; font-size: 9pt; font-weight: bold; margin-bottom: 6px; color: #475569; }}
-                        table {{ width: 100%; border-collapse: collapse; page-break-inside: auto; }}
-                        tr {{ page-break-inside: avoid; page-break-after: auto; }}
-                        th, td {{ border: 1px solid #64748B; padding: 3px 3px; text-align: center; font-size: 8pt; white-space: nowrap; }}
-                        th {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
-                        .grand {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
-                    </style>
-                </head>
-                <body>
-                    <h2>MONTHLY FINE SETTLEMENT SHEET — SECTION: {selected_section}</h2>
-                    <div class="sub">Billing Cycle: {cycle_label}</div>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Student ID</th>
-                                <th>Student Name</th>
-                                <th>Abs</th>
-                                <th>Late</th>
-                                <th>Auto Fine</th>
-                                <th>Disc.</th>
-                                <th>Total (Rs.)</th>
-                                <th>Warnings</th>
-                                <th>Remarks</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {fine_rows_html}
-                            <tr class="grand">
-                                <td colspan="2">GRAND TOTAL</td>
-                                <td>{tot_abs_sum}</td>
-                                <td>{tot_late_sum}</td>
-                                <td>Rs. {tot_auto_fine_sum:,}</td>
-                                <td>Rs. {tot_disc_fine_sum:,}</td>
-                                <td>Rs. {tot_grand_sum:,}</td>
-                                <td colspan="2"></td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </body>
-                </html>
-                """
+                    print_fine_script = (
+                        "<script>"
+                        "function printFineReport() {"
+                        "    var myWindow = window.open('', '_blank', 'width=950,height=650');"
+                        f"    myWindow.document.write(`{print_html}`);"
+                        "    myWindow.document.close();"
+                        "    myWindow.focus();"
+                        "    setTimeout(function() {{ myWindow.print(); myWindow.close(); }}, 500);"
+                        "}"
+                        "</script>"
+                        "<button onclick=\"printFineReport()\" style=\""
+                        "    width: 100%; background-color: #8B5CF6; color: white; padding: 10px 15px;"
+                        "    border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer;"
+                        "\">🖨️ Print Section Fine Sheet (A4 Portrait)</button>"
+                    )
+                    st.components.v1.html(print_fine_script, height=60)
 
-                print_fine_script = (
-                    "<script>"
-                    "function printFineReport() {"
-                    "    var myWindow = window.open('', '_blank', 'width=950,height=650');"
-                    f"    myWindow.document.write(`{print_html}`);"
-                    "    myWindow.document.close();"
-                    "    myWindow.focus();"
-                    "    setTimeout(function() {{ myWindow.print(); myWindow.close(); }}, 500);"
-                    "}"
-                    "</script>"
-                    "<button onclick=\"printFineReport()\" style=\""
-                    "    width: 100%; background-color: #8B5CF6; color: white; padding: 10px 15px;"
-                    "    border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer;"
-                    "\">🖨️ Print Section Fine Sheet (A4 Portrait)</button>"
-                )
-                st.components.v1.html(print_fine_script, height=60)
+            else:
+                viewer_report_items = []
+                tot_abs_sum = 0
+                tot_late_sum = 0
+                tot_auto_fine_sum = 0
+
+                for _, st_row in unique_students.iterrows():
+                    e_id = normalize_emp_id(st_row['emp_id'])
+                    e_name = str(st_row['name']).strip()
+                    emp_period_df = sec_logs[sec_logs['emp_id'] == e_id]
+                    
+                    abs_cnt, late_cnt, absent_fine, late_fine = calculate_student_fine_breakdown(emp_period_df, is_inliving=False)
+                    auto_fine = absent_fine + late_fine
+                    warn_status = warning_map.get(e_id, "Normal")
+
+                    tot_abs_sum += abs_cnt
+                    tot_late_sum += late_cnt
+                    tot_auto_fine_sum += auto_fine
+
+                    viewer_report_items.append({
+                        'Student ID': e_id,
+                        'Student Name': e_name,
+                        'Abs': abs_cnt,
+                        'Late': late_cnt,
+                        'Auto Fine (Rs.)': auto_fine,
+                        'Warnings': warn_status
+                    })
+
+                df_viewer_display = pd.DataFrame(viewer_report_items)
+                st.dataframe(df_viewer_display, use_container_width=True)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Absences", tot_abs_sum)
+                m2.metric("Total Lates", tot_late_sum)
+                m3.metric("Total Auto Fines", f"Rs. {tot_auto_fine_sum:,}")
