@@ -117,16 +117,10 @@ def load_all_attendance_logs():
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
-# --- AUTHENTICATION GATEWAY WITH URL QUERY PARAMS PERSISTENCE ---
-query_params = st.query_params
-
+# --- SECURE AUTHENTICATION GATEWAY ---
 if 'authenticated' not in st.session_state:
-    if query_params.get("role") in ['Admin', 'Viewer']:
-        st.session_state['authenticated'] = True
-        st.session_state['role'] = query_params.get("role")
-    else:
-        st.session_state['authenticated'] = False
-        st.session_state['role'] = None
+    st.session_state['authenticated'] = False
+    st.session_state['role'] = None
 
 if not st.session_state['authenticated']:
     st.title("🔐 Enterprise Attendance Suite — Secure Login")
@@ -299,7 +293,7 @@ def detect_shift_and_threshold(df_records):
         if avg_hour >= 11:
             shift_name = 'Second Shift'
 
-    late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:15'
+    late_threshold = ('14:05' if is_friday else '12:55') if shift_name == 'Second Shift' else '08:05'
     return shift_name, late_threshold, is_friday
 
 def parse_biotime_excel(uploaded_file):
