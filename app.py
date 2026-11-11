@@ -1,6 +1,6 @@
 import os
 import sqlite3
-import subprocess
+import base64
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -8,7 +8,102 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-st.set_page_config(page_title="ZKBioTime Attendance Suite & Fine Management", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="CTTI Enterprise Attendance & Command Suite", 
+    page_icon="⚡", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- HELPER TO CONVERT LOCAL IMAGES TO BASE64 FOR CSS BACKGROUNDS ---
+def get_base64_image(image_path):
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            data = f.read()
+        return base64.b64encode(data).decode()
+    return ""
+
+campus_bg_b64 = get_base64_image("ctti_campus.jpg")
+
+# --- INJECT CINEMATIC GLASSMORPHISM & CUSTOM THEME CSS ---
+st.markdown(f"""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    
+    html, body, [class*="css"] {{
+        font-family: 'Inter', sans-serif;
+    }}
+    
+    .stApp {{
+        background-color: #0F172A;
+        color: #F8FAFC;
+    }}
+    
+    /* Cinematic Login Background Overlay */
+    .login-bg-overlay {{
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        background-image: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.92)), url("data:image/jpeg;base64,{campus_bg_b64}");
+        background-size: cover;
+        background-position: center;
+        z-index: -1;
+    }}
+    
+    /* Sleek Glassmorphism Login Container */
+    .login-card {{
+        background: rgba(30, 41, 59, 0.80);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        padding: 40px;
+        border-radius: 24px;
+        box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
+    }}
+    
+    /* Modern Pill Tabs Styling */
+    .stTabs [data-baseweb="tab-list"] {{
+        gap: 8px;
+        background-color: #1E293B;
+        padding: 8px;
+        border-radius: 12px;
+        border: 1px solid #334155;
+    }}
+    .stTabs [data-baseweb="tab"] {{
+        background-color: transparent;
+        border-radius: 8px;
+        color: #94A3B8;
+        font-weight: 600;
+        padding: 10px 18px;
+        transition: all 0.2s ease;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background: linear-gradient(135deg, #2563EB, #1D4ED8) !important;
+        color: white !important;
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+    }}
+    
+    /* Custom Buttons */
+    .stButton button {{
+        border-radius: 10px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        transition: all 0.2s ease;
+    }}
+    .stButton button:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 6px 15px rgba(59, 130, 246, 0.3);
+    }}
+    
+    /* Sidebar Styling */
+    [data-testid="stSidebar"] {{
+        background-color: #0B0F19;
+        border-right: 1px solid #1E293B;
+    }}
+</style>
+""", unsafe_allow_html=True)
 
 DB_FILE = "attendance_history.db"
 
@@ -60,7 +155,6 @@ def init_db():
         )
     ''')
     
-    # Ensure unique index exists so SQLite UPSERT never fails
     c.execute('''
         CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_unique 
         ON attendance_logs (emp_id, record_date, shift_name)
@@ -101,15 +195,12 @@ def update_db_password(role_key, new_pass):
     conn.commit()
     conn.close()
 
-# --- ID NORMALIZATION & FETCH HELPERS (PRESERVING LEADING ZEROS) ---
 def normalize_emp_id(val):
-    """Strips whitespace while keeping exact ID strings (including leading zeros like 25-AI-01)."""
     if pd.isna(val):
         return ""
     return str(val).strip()
 
 def load_all_attendance_logs():
-    """Always query fresh data directly from SQLite DB."""
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
     conn.close()
@@ -117,42 +208,58 @@ def load_all_attendance_logs():
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
-# --- SECURE AUTHENTICATION GATEWAY ---
+# --- SECURE AUTHENTICATION GATEWAY WITH CINEMATIC LOGIN UI ---
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['role'] = None
 
 if not st.session_state['authenticated']:
-    st.title("🔐 Enterprise Attendance Suite — Secure Login")
-    st.markdown("Please log in with your assigned credentials to access the portal.")
+    st.markdown('<div class="login-bg-overlay"></div>', unsafe_allow_html=True)
+    st.markdown("<br><br>", unsafe_allow_html=True)
     
-    with st.form("login_form"):
-        role_choice = st.selectbox("Select Role:", ["Viewer (Read-Only)", "Admin (Full Access)"])
-        password_input = st.text_input("Enter Password:", type="password")
-        submit_login = st.form_submit_button("Login to Portal", type="primary")
-        
-        if submit_login:
-            current_admin_pass = get_db_password('admin_pass')
-            current_viewer_pass = get_db_password('viewer_pass')
+    col1, col2, col3 = st.columns([1, 1.3, 1])
+    with col2:
+        if os.path.exists("ctti_logo.png"):
+            st.image("ctti_logo.png", width=120, use_column_width=False)
             
-            if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
-                st.session_state['authenticated'] = True
-                st.session_state['role'] = 'Admin'
-                st.query_params["role"] = "Admin"
-                st.rerun()
-            elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
-                st.session_state['authenticated'] = True
-                st.session_state['role'] = 'Viewer'
-                st.query_params["role"] = "Viewer"
-                st.rerun()
-            else:
-                st.error("❌ Incorrect password. Please try again.")
+        st.markdown("""
+        <div style="text-align: center; margin-bottom: 20px;">
+            <h1 style="font-size: 26px; font-weight: 700; color: #F8FAFC; margin-bottom: 4px;">Welcome to Attendance Portal</h1>
+            <p style="color: #94A3B8; font-size: 13px; font-weight: 500;">Enterprise Attendance & Disciplinary Intelligence Suite, Proudly developed by ICT Dept.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        with st.form("login_form"):
+            role_choice = st.selectbox("Select Access Role:", ["Viewer (Read-Only)", "Admin (Full Access)"])
+            password_input = st.text_input("Enter Security Key:", type="password")
+            st.markdown("<br>", unsafe_allow_html=True)
+            submit_login = st.form_submit_button("Authenticate & Enter Hub", type="primary", use_container_width=True)
+            
+            if submit_login:
+                current_admin_pass = get_db_password('admin_pass')
+                current_viewer_pass = get_db_password('viewer_pass')
+                
+                if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
+                    st.session_state['authenticated'] = True
+                    st.session_state['role'] = 'Admin'
+                    st.query_params["role"] = "Admin"
+                    st.rerun()
+                elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
+                    st.session_state['authenticated'] = True
+                    st.session_state['role'] = 'Viewer'
+                    st.query_params["role"] = "Viewer"
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid security key. Access denied.")
     st.stop()
 
-# --- SIDEBAR USER INFO, LOGOUT & PASSWORD MANAGEMENT ---
+# --- SIDEBAR BRAND ANCHOR & SETTINGS ---
 with st.sidebar:
-    st.write(f"👤 Logged in as: **{st.session_state['role']}**")
-    if st.button("🚪 Logout", use_container_width=True):
+    if os.path.exists("ctti_logo.png"):
+        st.image("ctti_logo.png", width=90)
+    st.markdown("### 🛡️ Session Security")
+    st.info(f"Connected Role:\n**{st.session_state['role']}**")
+    if st.button("🚪 Terminate Session", use_container_width=True):
         st.session_state['authenticated'] = False
         st.session_state['role'] = None
         if "role" in st.query_params:
@@ -161,31 +268,27 @@ with st.sidebar:
     
     if st.session_state['role'] == 'Admin':
         st.markdown("---")
-        st.markdown("### 🔑 Password Management")
+        st.markdown("### 🔑 Credential Manager")
         
-        with st.expander("Change Admin Password"):
-            new_a_pass = st.text_input("New Admin Password", type="password", key="new_admin_pass_input")
-            if st.button("Update Admin Password", use_container_width=True):
+        with st.expander("Update Admin Key"):
+            new_a_pass = st.text_input("New Admin Key", type="password", key="new_admin_pass_input")
+            if st.button("Save Admin Key", use_container_width=True):
                 if new_a_pass.strip():
                     update_db_password('admin_pass', new_a_pass.strip())
-                    st.success("Admin password updated successfully!")
+                    st.success("Admin key updated!")
                 else:
-                    st.warning("Password cannot be empty.")
+                    st.warning("Key cannot be empty.")
                     
-        with st.expander("Change Viewer Password"):
-            new_v_pass = st.text_input("New Viewer Password", type="password", key="new_viewer_pass_input")
-            if st.button("Update Viewer Password", use_container_width=True):
+        with st.expander("Update Viewer Key"):
+            new_v_pass = st.text_input("New Viewer Key", type="password", key="new_viewer_pass_input")
+            if st.button("Save Viewer Key", use_container_width=True):
                 if new_v_pass.strip():
                     update_db_password('viewer_pass', new_v_pass.strip())
-                    st.success("Viewer password updated successfully!")
+                    st.success("Viewer key updated!")
                 else:
-                    st.warning("Password cannot be empty.")
+                    st.warning("Key cannot be empty.")
 
 def save_records_to_db(df):
-    """
-    Saves baseline attendance to SQLite. 
-    PROTECTION RULE: Preserves existing manual overrides and batch leave conversions.
-    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     for _, r in df.iterrows():
@@ -259,7 +362,6 @@ def parse_dept_header(dept_str):
     return parent_dept, sub_dept, year_str, sec_str, clean_str
 
 def parse_flexible_date(date_val):
-    """Safely parses dates regardless of format variations."""
     if pd.isna(date_val):
         return datetime.now().strftime('%Y-%m-%d')
     date_str = str(date_val).strip()
@@ -1127,7 +1229,6 @@ def generate_all_reports_suite(df, leave_mapping):
 
     return os.path.abspath(output_dir)
 
-# --- FINE CALCULATION LOGIC ---
 def calculate_student_fine_breakdown(emp_df, is_inliving=False):
     absent_records = emp_df[emp_df['is_absent'] == 1].copy()
     late_records = emp_df[emp_df['is_late'] == 1].copy()
@@ -1268,8 +1369,20 @@ def generate_fine_excel(report_data, section_code, date_range_str):
     wb.save(output)
     return output.getvalue()
 
-# --- STREAMLIT UI TABS (ROLE-BASED) ---
-st.title("📊 Enterprise Attendance Suite & Disciplinary Tracking")
+# --- EXECUTIVE COMMAND HUB HEADER ---
+st.markdown(f"""
+<div style="background: linear-gradient(135deg, #1E293B, #0F172A); padding: 25px 30px; border-radius: 16px; border: 1px solid #334155; margin-bottom: 25px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+            <h2 style="color: #F8FAFC; margin: 0; font-size: 22px; font-weight: 700;">⚡ CTTI Institutional Command Hub</h2>
+            <p style="color: #94A3B8; margin: 5px 0 0 0; font-size: 13px;">Active Role: <strong style="color: #3B82F6;">{st.session_state['role']}</strong> &nbsp;|&nbsp; Database Engine: <strong style="color: #10B981;">Online & Synchronized</strong></p>
+        </div>
+        <div>
+            <span style="background: rgba(16, 185, 129, 0.15); color: #34D399; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid rgba(16, 185, 129, 0.3);">🟢 System Secure</span>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 user_role = st.session_state['role']
 
@@ -1277,7 +1390,7 @@ if user_role == 'Admin':
     tab1, tab_archive_admin, tab2, tab3, tab4 = st.tabs([
         "🚀 Process Daily Log", 
         "📋 Daily Records Archive", 
-        "🚨 Warning, Overrides & Leave Portal", 
+        "🚨 Warnings, Overrides & Leave Portal", 
         "🔍 Student Profile Search", 
         "💰 Monthly Fine Settlement"
     ])
@@ -1299,7 +1412,6 @@ if user_role == 'Admin':
             try:
                 df, shift_name, late_thresh = parse_biotime_excel(uploaded_file)
                 if not df.empty:
-                    # Duplicate upload warning check
                     sample_date = df['Date'].iloc[0]
                     sample_shift = df['ShiftName'].iloc[0]
                     existing_db = load_all_attendance_logs()
@@ -1509,7 +1621,6 @@ with tab2:
                 use_container_width=True
             )
 
-        # ADMIN ONLY WRITE SECTIONS
         if user_role == 'Admin':
             st.markdown("---")
             st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
