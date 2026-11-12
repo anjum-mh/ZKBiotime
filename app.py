@@ -438,7 +438,7 @@ def detect_shift_and_threshold(df_records):
         if avg_hour >= 11:
             shift_name = 'Second Shift'
 
-    late_threshold = ('14:05' if is_friday else '12:55') if shift_name == 'Second Shift' else '08:05'
+    late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:10'
     return shift_name, late_threshold, is_friday
 
 def parse_biotime_excel(uploaded_file):
