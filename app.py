@@ -163,6 +163,23 @@ def init_db():
     ''')
 
     c.execute('''
+        CREATE TABLE IF NOT EXISTS leave_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT,
+            student_name TEXT,
+            dept_code TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            leave_type TEXT,
+            reason TEXT,
+            instructor_name TEXT,
+            status TEXT DEFAULT 'Pending',
+            admin_remarks TEXT,
+            submitted_at TEXT
+        )
+    ''')
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -170,6 +187,7 @@ def init_db():
     ''')
     
     c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('admin_pass', 'admin123')")
+    c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('instructor_pass', 'instructor123')")
     c.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('viewer_pass', 'viewer123')")
     
     try:
@@ -188,7 +206,9 @@ def get_db_password(role_key):
     c.execute("SELECT value FROM app_settings WHERE key = ?", (role_key,))
     res = c.fetchone()
     conn.close()
-    return res[0] if res else ('admin123' if role_key == 'admin_pass' else 'viewer123')
+    if res:
+        return res[0]
+    return 'admin123' if role_key == 'admin_pass' else ('instructor123' if role_key == 'instructor_pass' else 'viewer123')
 
 def update_db_password(role_key, new_pass):
     conn = sqlite3.connect(DB_FILE)
@@ -204,17 +224,23 @@ def normalize_emp_id(val):
 
 def load_all_attendance_logs():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+    except Exception:
+        df = pd.DataFrame()
     conn.close()
-    if not df.empty:
+    if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
 def load_student_profiles():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM student_profiles", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM student_profiles", conn)
+    except Exception:
+        df = pd.DataFrame(columns=['emp_id', 'name', 'dept_code', 'status', 'withdrawal_date', 'reinstated_date'])
     conn.close()
-    if not df.empty:
+    if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
@@ -236,6 +262,7 @@ def update_student_status(emp_id, status, date_str):
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['role'] = None
+    st.session_state['username'] = ""
 
 if not st.session_state['authenticated']:
     st.markdown('<div class="login-bg-overlay"></div>', unsafe_allow_html=True)
@@ -254,37 +281,51 @@ if not st.session_state['authenticated']:
         """, unsafe_allow_html=True)
         
         with st.form("login_form"):
-            role_choice = st.selectbox("Select Access Role:", ["Viewer (Read-Only)", "Admin (Full Access)"])
+            role_choice = st.selectbox("Select Access Role:", ["Admin (Full Access)", "Instructor Portal", "Viewer (Read-Only)"])
+            username_input = st.text_input("Instructor / User Name (Optional for Admin/Viewer):", value="")
             password_input = st.text_input("Enter Security Key:", type="password")
             st.markdown("<br>", unsafe_allow_html=True)
             submit_login = st.form_submit_button("Authenticate & Enter Hub", type="primary", use_container_width=True)
             
             if submit_login:
                 current_admin_pass = get_db_password('admin_pass')
+                current_instructor_pass = get_db_password('instructor_pass')
                 current_viewer_pass = get_db_password('viewer_pass')
                 
                 if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
                     st.session_state['authenticated'] = True
                     st.session_state['role'] = 'Admin'
+                    st.session_state['username'] = username_input.strip() or "Administrator"
                     st.query_params["role"] = "Admin"
                     st.rerun()
+                elif role_choice == "Instructor Portal" and password_input == current_instructor_pass:
+                    if not username_input.strip():
+                        st.error("❌ Please enter your Instructor Name before logging in.")
+                    else:
+                        st.session_state['authenticated'] = True
+                        st.session_state['role'] = 'Instructor'
+                        st.session_state['username'] = username_input.strip()
+                        st.query_params["role"] = "Instructor"
+                        st.rerun()
                 elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
                     st.session_state['authenticated'] = True
                     st.session_state['role'] = 'Viewer'
+                    st.session_state['username'] = username_input.strip() or "Executive Viewer"
                     st.query_params["role"] = "Viewer"
                     st.rerun()
                 else:
-                    st.error("❌ Invalid security key. Access denied.")
+                    st.error("❌ Invalid security key or missing name. Access denied.")
     st.stop()
 
 with st.sidebar:
     if os.path.exists("ctti_logo.png"):
         st.image("ctti_logo.png", width=90)
     st.markdown("### 🛡️ Session Security")
-    st.info(f"Connected Role:\n**{st.session_state['role']}**")
+    st.info(f"Connected User:\n**{st.session_state.get('username', 'User')}**\n\nRole:\n**{st.session_state['role']}**")
     if st.button("🚪 Terminate Session", use_container_width=True):
         st.session_state['authenticated'] = False
         st.session_state['role'] = None
+        st.session_state['username'] = ""
         if "role" in st.query_params:
             del st.query_params["role"]
         st.rerun()
@@ -302,6 +343,15 @@ with st.sidebar:
                 else:
                     st.warning("Key cannot be empty.")
                     
+        with st.expander("Update Instructor Key"):
+            new_i_pass = st.text_input("New Instructor Key", type="password", key="new_instructor_pass_input")
+            if st.button("Save Instructor Key", use_container_width=True):
+                if new_i_pass.strip():
+                    update_db_password('instructor_pass', new_i_pass.strip())
+                    st.success("Instructor key updated!")
+                else:
+                    st.warning("Key cannot be empty.")
+
         with st.expander("Update Viewer Key"):
             new_v_pass = st.text_input("New Viewer Key", type="password", key="new_viewer_pass_input")
             if st.button("Save Viewer Key", use_container_width=True):
@@ -343,19 +393,6 @@ def save_records_to_db(df):
             dept_code, str(r['ClockIn']).strip(), int(r['IsPresent']),
             int(r['IsAbsent']), int(r['IsLate'])
         ))
-    conn.commit()
-    conn.close()
-
-def convert_absence_to_leave(emp_id, dates_list, shift_name, reason):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    norm_id = normalize_emp_id(emp_id)
-    for d_str in dates_list:
-        c.execute('''
-            UPDATE attendance_logs
-            SET is_absent = 0, is_leave = 1, excuse_reason = ?
-            WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
-        ''', (reason, norm_id, str(d_str), str(shift_name)))
     conn.commit()
     conn.close()
 
@@ -438,7 +475,7 @@ def detect_shift_and_threshold(df_records):
         if avg_hour >= 11:
             shift_name = 'Second Shift'
 
-    late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:10'
+    late_threshold = ('14:05' if is_friday else '12:55') if shift_name == 'Second Shift' else '08:05'
     return shift_name, late_threshold, is_friday
 
 def parse_biotime_excel(uploaded_file):
@@ -526,10 +563,13 @@ def apply_leave_and_status_filtering(df, leave_mapping):
     df = df.copy()
     
     profiles = load_student_profiles()
-    if not profiles.empty:
+    if not profiles.empty and 'status' in profiles.columns and 'emp_id' in profiles.columns:
         withdrawn_ids = set(profiles[profiles['status'] == 'Withdrawn']['emp_id'].tolist())
         if withdrawn_ids:
-            df = df[~df['emp_id'].isin(withdrawn_ids)]
+            if 'EmpID' in df.columns:
+                df = df[~df['EmpID'].isin(withdrawn_ids)]
+            elif 'emp_id' in df.columns:
+                df = df[~df['emp_id'].isin(withdrawn_ids)]
 
     df['IsLeave'] = 0
     df['IsAbsent'] = 1 - df['IsPresent']
@@ -646,623 +686,6 @@ def build_html_report(df, leave_mapping, shift_title, report_date):
     html += "</tbody></table></body></html>"
     return html
 
-def generate_interactive_master_workbook(df, output_path):
-    wb = openpyxl.Workbook()
-    default_sheet = wb.active
-
-    primary_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    font_title = Font(name="Calibri", size=14, bold=True, color="1E293B")
-    font_hdr = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_reg = Font(name="Calibri", size=11)
-    font_grand = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
-    
-    btn_blue_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
-    btn_blue_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    btn_blue_border = Border(left=Side(style='medium', color='1E40AF'), right=Side(style='medium', color='1E40AF'), top=Side(style='medium', color='1E40AF'), bottom=Side(style='medium', color='1E40AF'))
-
-    btn_dark_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
-    btn_dark_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    btn_dark_border = Border(left=Side(style='medium', color='0F172A'), right=Side(style='medium', color='0F172A'), top=Side(style='medium', color='0F172A'), bottom=Side(style='medium', color='0F172A'))
-
-    btn_amber_fill = PatternFill(start_color="D97706", end_color="D97706", fill_type="solid")
-    btn_amber_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    btn_amber_border = Border(left=Side(style='medium', color='B45309'), right=Side(style='medium', color='B45309'), top=Side(style='medium', color='B45309'), bottom=Side(style='medium', color='B45309'))
-
-    thin_side = Side(border_style="thin", color="CBD5E1")
-    double_bottom = Side(border_style="double", color="1E293B")
-    border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    border_grand = Border(left=thin_side, right=thin_side, top=thin_side, bottom=double_bottom)
-
-    used_sheet_names = set()
-
-    def make_unique_sheet_name(raw_name, prefix=""):
-        clean_name = raw_name.strip().replace(' ', '_').replace('/', '_').replace('-', '_')
-        candidate = f"{prefix}{clean_name}"[:28]
-        final_name = candidate
-        counter = 1
-        while final_name.lower() in [s.lower() for s in used_sheet_names]:
-            final_name = f"{candidate[:24]}_{counter}"
-            counter += 1
-        used_sheet_names.add(final_name)
-        return final_name
-
-    parent_sheets = {}
-    sub_dept_sheets = {}
-    section_sheets = {}
-    absent_sheets = {}
-    late_sheets = {}
-
-    for parent in PARENT_ORDER:
-        p_data = df[df['ParentDept'] == parent]
-        if p_data.empty:
-            continue
-        parent_sheets[parent] = make_unique_sheet_name(parent[:15], "Sub_")
-
-        for sub_dept, sub_group in p_data.groupby('SubDept'):
-            sub_dept_sheets[sub_dept] = make_unique_sheet_name(sub_dept[:15], "Sec_")
-
-            for dept_code, sec_group in sub_group.groupby('DeptCode'):
-                section_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "D_")
-                absent_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "Abs_")
-                late_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "Late_")
-
-    ws_master = wb.create_sheet(title="Master Summary")
-    ws_master.views.sheetView[0].showGridLines = True
-    ws_master.merge_cells("A1:G1")
-    ws_master["A1"] = "HIERARCHICAL ATTENDANCE SUMMARY (MASTER)"
-    ws_master["A1"].font = font_title
-    ws_master["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws_master.row_dimensions[1].height = 25
-
-    headers = ["Parent Department", "Total Strength", "Total Present", "Total Absent", "Total Leave", "Total Late", "Action Button"]
-    for c_idx, h in enumerate(headers, 1):
-        cell = ws_master.cell(row=2, column=c_idx, value=h)
-        cell.font = font_hdr
-        cell.fill = primary_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border_cell
-    ws_master.row_dimensions[2].height = 22
-
-    r_idx = 3
-    master_start_row = 3
-    for parent in PARENT_ORDER:
-        p_data = df[df['ParentDept'] == parent]
-        if p_data.empty:
-            continue
-        tot = len(p_data)
-        pres = int(p_data['IsPresent'].sum())
-        leave = int(p_data['IsLeave'].sum())
-        absent = max(0, tot - pres - leave)
-        late = int(p_data['IsLate'].sum())
-
-        sub_sheet_name = parent_sheets[parent]
-        
-        ws_master.cell(row=r_idx, column=1, value=parent).font = font_reg
-        ws_master.cell(row=r_idx, column=2, value=tot).font = font_reg
-        ws_master.cell(row=r_idx, column=3, value=pres).font = font_reg
-        ws_master.cell(row=r_idx, column=4, value=absent).font = font_reg
-        ws_master.cell(row=r_idx, column=5, value=leave).font = font_reg
-        ws_master.cell(row=r_idx, column=6, value=late).font = font_reg
-        
-        action_cell = ws_master.cell(row=r_idx, column=7, value=" VIEW CHILD DEPTS ")
-        action_cell.font = btn_blue_font
-        action_cell.fill = btn_blue_fill
-        action_cell.border = btn_blue_border
-        action_cell.alignment = Alignment(horizontal="center", vertical="center")
-        action_cell.hyperlink = f"#'{sub_sheet_name}'!A1"
-
-        for c in range(1, 7):
-            c_cell = ws_master.cell(row=r_idx, column=c)
-            c_cell.border = border_cell
-            if c > 1:
-                c_cell.alignment = Alignment(horizontal="center", vertical="center")
-            else:
-                c_cell.alignment = Alignment(horizontal="left", vertical="center")
-        ws_master.row_dimensions[r_idx].height = 24
-        r_idx += 1
-
-    master_end_row = r_idx - 1
-
-    ws_master.cell(row=r_idx, column=1, value="GRAND TOTAL").font = font_grand
-    ws_master.cell(row=r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
-        cell = ws_master.cell(row=r_idx, column=c_idx, value=f"=SUM({col_letter}{master_start_row}:{col_letter}{master_end_row})")
-        cell.font = font_grand
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws_master.cell(row=r_idx, column=7, value="").fill = primary_fill
-
-    for c in range(1, 8):
-        c_cell = ws_master.cell(row=r_idx, column=c)
-        c_cell.border = border_grand
-        if c < 7:
-            c_cell.fill = primary_fill
-    ws_master.row_dimensions[r_idx].height = 25
-
-    ws_master.column_dimensions['A'].width = 45
-    for col in ['B', 'C', 'D', 'E', 'F']:
-        ws_master.column_dimensions[col].width = 18
-    ws_master.column_dimensions['G'].width = 26
-
-    for parent in PARENT_ORDER:
-        p_data = df[df['ParentDept'] == parent]
-        if p_data.empty:
-            continue
-        sub_sheet_name = parent_sheets[parent]
-        ws_sub = wb.create_sheet(title=sub_sheet_name)
-        ws_sub.views.sheetView[0].showGridLines = True
-
-        ws_sub.merge_cells("A1:G1")
-        ws_sub["A1"] = f"{parent.upper()} - SUB DEPARTMENTS"
-        ws_sub["A1"].font = font_title
-        ws_sub["A1"].alignment = Alignment(horizontal="center", vertical="center")
-        ws_sub.row_dimensions[1].height = 25
-
-        back_cell = ws_sub.cell(row=2, column=1, value=" ◀ BACK TO MASTER ")
-        back_cell.font = btn_dark_font
-        back_cell.fill = btn_dark_fill
-        back_cell.border = btn_dark_border
-        back_cell.alignment = Alignment(horizontal="center", vertical="center")
-        back_cell.hyperlink = "#'Master Summary'!A1"
-
-        sub_headers = ["Child / Sub-Department", "Total Strength", "Total Present", "Total Absent", "Total Leave", "Total Late", "Action Button"]
-        for c_idx, h in enumerate(sub_headers, 1):
-            cell = ws_sub.cell(row=3, column=c_idx, value=h)
-            cell.font = font_hdr
-            cell.fill = primary_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = border_cell
-        ws_sub.row_dimensions[3].height = 22
-
-        sub_start_row = 4
-        sub_r_idx = sub_start_row
-        for sub_dept, sub_group in p_data.groupby('SubDept'):
-            stot = len(sub_group)
-            spres = int(sub_group['IsPresent'].sum())
-            sleave = int(sub_group['IsLeave'].sum())
-            sabsent = max(0, stot - spres - sleave)
-            slate = int(sub_group['IsLate'].sum())
-
-            sec_sheet_name = sub_dept_sheets[sub_dept]
-
-            ws_sub.cell(row=sub_r_idx, column=1, value=sub_dept).font = font_reg
-            ws_sub.cell(row=sub_r_idx, column=2, value=stot).font = font_reg
-            ws_sub.cell(row=sub_r_idx, column=3, value=spres).font = font_reg
-            ws_sub.cell(row=sub_r_idx, column=4, value=sabsent).font = font_reg
-            ws_sub.cell(row=sub_r_idx, column=5, value=sleave).font = font_reg
-            ws_sub.cell(row=sub_r_idx, column=6, value=slate).font = font_reg
-
-            act_cell = ws_sub.cell(row=sub_r_idx, column=7, value=" VIEW SECTIONS ")
-            act_cell.font = btn_blue_font
-            act_cell.fill = btn_blue_fill
-            act_cell.border = btn_blue_border
-            act_cell.alignment = Alignment(horizontal="center", vertical="center")
-            act_cell.hyperlink = f"#'{sec_sheet_name}'!A1"
-
-            for c in range(1, 7):
-                c_cell = ws_sub.cell(row=sub_r_idx, column=c)
-                c_cell.border = border_cell
-                if c > 1:
-                    c_cell.alignment = Alignment(horizontal="center", vertical="center")
-                else:
-                    c_cell.alignment = Alignment(horizontal="left", vertical="center")
-            ws_sub.row_dimensions[sub_r_idx].height = 24
-            sub_r_idx += 1
-
-        sub_end_row = sub_r_idx - 1
-
-        ws_sub.cell(row=sub_r_idx, column=1, value="TOTAL").font = font_grand
-        ws_sub.cell(row=sub_r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
-        for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
-            cell = ws_sub.cell(row=sub_r_idx, column=c_idx, value=f"=SUM({col_letter}{sub_start_row}:{col_letter}{sub_end_row})")
-            cell.font = font_grand
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws_sub.cell(row=sub_r_idx, column=7, value="").fill = primary_fill
-
-        for c in range(1, 8):
-            c_cell = ws_sub.cell(row=sub_r_idx, column=c)
-            c_cell.border = border_grand
-            if c < 7:
-                c_cell.fill = primary_fill
-        ws_sub.row_dimensions[sub_r_idx].height = 25
-
-        ws_sub.column_dimensions['A'].width = 40
-        for col in ['B', 'C', 'D', 'E', 'F']:
-            ws_sub.column_dimensions[col].width = 18
-        ws_sub.column_dimensions['G'].width = 24
-
-        for sub_dept, sub_group in p_data.groupby('SubDept'):
-            sec_sheet_name = sub_dept_sheets[sub_dept]
-            ws_sec = wb.create_sheet(title=sec_sheet_name)
-            ws_sec.views.sheetView[0].showGridLines = True
-            ws_sec.merge_cells("A1:G1")
-            ws_sec["A1"] = f"{sub_dept.upper()} - SECTIONS SUMMARY"
-            ws_sec["A1"].font = font_title
-            ws_sec["A1"].alignment = Alignment(horizontal="center", vertical="center")
-            ws_sec.row_dimensions[1].height = 25
-
-            b_cell = ws_sec.cell(row=2, column=1, value=" ◀ BACK TO SUB-DEPTS ")
-            b_cell.font = btn_dark_font
-            b_cell.fill = btn_dark_fill
-            b_cell.border = btn_dark_border
-            b_cell.alignment = Alignment(horizontal="center", vertical="center")
-            b_cell.hyperlink = f"#'{sub_sheet_name}'!A1"
-
-            sec_headers = ["Year & Section", "Total Strength", "Present", "Absent", "Leave", "Late", "Action Button"]
-            for c_idx, h in enumerate(sec_headers, 1):
-                cell = ws_sec.cell(row=3, column=c_idx, value=h)
-                cell.font = font_hdr
-                cell.fill = primary_fill
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border = border_cell
-            ws_sec.row_dimensions[3].height = 22
-
-            sec_start_row = 4
-            sec_r_idx = sec_start_row
-            for dept_code, sec_group in sub_group.groupby('DeptCode'):
-                dtot = len(sec_group)
-                dpres = int(sec_group['IsPresent'].sum())
-                dleave = int(sec_group['IsLeave'].sum())
-                dabsent = max(0, dtot - dpres - dleave)
-                dlate = int(sec_group['IsLate'].sum())
-
-                detail_sheet_name = section_sheets[dept_code]
-
-                ws_sec.cell(row=sec_r_idx, column=1, value=dept_code).font = font_reg
-                ws_sec.cell(row=sec_r_idx, column=2, value=dtot).font = font_reg
-                ws_sec.cell(row=sec_r_idx, column=3, value=dpres).font = font_reg
-                ws_sec.cell(row=sec_r_idx, column=4, value=dabsent).font = font_reg
-                ws_sec.cell(row=sec_r_idx, column=5, value=dleave).font = font_reg
-                ws_sec.cell(row=sec_r_idx, column=6, value=dlate).font = font_reg
-
-                d_act = ws_sec.cell(row=sec_r_idx, column=7, value=" VIEW DETAILS ")
-                d_act.font = btn_blue_font
-                d_act.fill = btn_blue_fill
-                d_act.border = btn_blue_border
-                d_act.alignment = Alignment(horizontal="center", vertical="center")
-                d_act.hyperlink = f"#'{detail_sheet_name}'!A1"
-
-                for c in range(1, 7):
-                    c_cell = ws_sec.cell(row=sec_r_idx, column=c)
-                    c_cell.border = border_cell
-                    if c > 1:
-                        c_cell.alignment = Alignment(horizontal="center", vertical="center")
-                    else:
-                        c_cell.alignment = Alignment(horizontal="left", vertical="center")
-                ws_sec.row_dimensions[sec_r_idx].height = 24
-                sec_r_idx += 1
-
-            sec_end_row = sec_r_idx - 1
-
-            ws_sec.cell(row=sec_r_idx, column=1, value="TOTAL").font = font_grand
-            ws_sec.cell(row=sec_r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
-            for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
-                cell = ws_sec.cell(row=sec_r_idx, column=c_idx, value=f"=SUM({col_letter}{sec_start_row}:{col_letter}{sec_end_row})")
-                cell.font = font_grand
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            ws_sec.cell(row=sec_r_idx, column=7, value="").fill = primary_fill
-
-            for c in range(1, 8):
-                c_cell = ws_sec.cell(row=sec_r_idx, column=c)
-                c_cell.border = border_grand
-                if c < 7:
-                    c_cell.fill = primary_fill
-            ws_sec.row_dimensions[sec_r_idx].height = 25
-
-            ws_sec.column_dimensions['A'].width = 30
-            for col in ['B', 'C', 'D', 'E', 'F']:
-                ws_sec.column_dimensions[col].width = 18
-            ws_sec.column_dimensions['G'].width = 22
-
-            for dept_code, sec_group in sub_group.groupby('DeptCode'):
-                detail_sheet_name = section_sheets[dept_code]
-                abs_sheet_name = absent_sheets[dept_code]
-                late_sheet_name = late_sheets[dept_code]
-
-                ws_det = wb.create_sheet(title=detail_sheet_name)
-                ws_det.views.sheetView[0].showGridLines = True
-                ws_det.merge_cells("A1:F1")
-                ws_det["A1"] = f"SECTION ROSTER: {sub_dept} ({dept_code})"
-                ws_det["A1"].font = font_title
-                ws_det["A1"].alignment = Alignment(horizontal="center", vertical="center")
-                ws_det.row_dimensions[1].height = 25
-
-                det_back = ws_det.cell(row=2, column=1, value=" ◀ BACK TO SECTIONS ")
-                det_back.font = btn_dark_font
-                det_back.fill = btn_dark_fill
-                det_back.border = btn_dark_border
-                det_back.alignment = Alignment(horizontal="center", vertical="center")
-                det_back.hyperlink = f"#'{sec_sheet_name}'!A1"
-
-                abs_link = ws_det.cell(row=2, column=3, value=" VIEW ABSENT STUDENTS ")
-                abs_link.font = btn_amber_font
-                abs_link.fill = btn_amber_fill
-                abs_link.border = btn_amber_border
-                abs_link.alignment = Alignment(horizontal="center", vertical="center")
-                abs_link.hyperlink = f"#'{abs_sheet_name}'!A1"
-
-                late_link = ws_det.cell(row=2, column=5, value=" VIEW LATE STUDENTS ")
-                late_link.font = btn_amber_font
-                late_link.fill = btn_amber_fill
-                late_link.border = btn_amber_border
-                late_link.alignment = Alignment(horizontal="center", vertical="center")
-                late_link.hyperlink = f"#'{late_sheet_name}'!A1"
-                ws_det.row_dimensions[2].height = 26
-
-                det_headers = ["Employee ID", "Employee Name", "Sub-Department", "Year & Section", "Clock-In Time", "Status"]
-                for c_idx, h in enumerate(det_headers, 1):
-                    cell = ws_det.cell(row=3, column=c_idx, value=h)
-                    cell.font = font_hdr
-                    cell.fill = primary_fill
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                    cell.border = border_cell
-                ws_det.row_dimensions[3].height = 22
-
-                green_fill = PatternFill(start_color="D1E7DD", end_color="D1E7DD", fill_type="solid")
-                green_font = Font(name="Calibri", size=11, color="0F5132", bold=True)
-                amber_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
-                amber_font = Font(name="Calibri", size=11, color="664D03", bold=True)
-                red_fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
-                red_font = Font(name="Calibri", size=11, color="842029", bold=True)
-
-                d_r_idx = 4
-                for _, row in sec_group.iterrows():
-                    is_pres = row['IsPresent'] == 1
-                    is_leave = row['IsLeave'] == 1
-                    is_late = row['IsLate'] == 1
-
-                    if is_late:
-                        status_str = f"LATE ({row['ClockIn']})"
-                        s_fill, s_font = amber_fill, amber_font
-                    elif is_pres:
-                        status_str = f"PRESENT ({row['ClockIn']})"
-                        s_fill, s_font = green_fill, green_font
-                    elif is_leave:
-                        status_str = "LEAVE (Excused)"
-                        s_fill, s_font = amber_fill, amber_font
-                    else:
-                        status_str = "ABSENT (--:--)"
-                        s_fill, s_font = red_fill, red_font
-
-                    ws_det.cell(row=d_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
-                    ws_det.cell(row=d_r_idx, column=2, value=str(row['Name'])).font = font_reg
-                    ws_det.cell(row=d_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
-                    ws_det.cell(row=d_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
-                    ws_det.cell(row=d_r_idx, column=5, value=str(row['ClockIn']) if row['ClockIn'] else "--:--").font = font_reg
-                    
-                    status_cell = ws_det.cell(row=d_r_idx, column=6, value=status_str)
-                    status_cell.font = s_font
-                    status_cell.fill = s_fill
-
-                    for c in range(1, 7):
-                        c_cell = ws_det.cell(row=d_r_idx, column=c)
-                        c_cell.border = border_cell
-                        if c != 6:
-                            c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
-                        else:
-                            c_cell.alignment = Alignment(horizontal="center", vertical="center")
-                    ws_det.row_dimensions[d_r_idx].height = 20
-                    d_r_idx += 1
-
-                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
-                    ws_det.column_dimensions[col].width = 22
-
-                abs_group = sec_group[(sec_group['IsPresent'] == 0) & (sec_group['IsLeave'] == 0)]
-                ws_abs = wb.create_sheet(title=abs_sheet_name)
-                ws_abs.views.sheetView[0].showGridLines = True
-                ws_abs.merge_cells("A1:F1")
-                ws_abs["A1"] = f"ABSENT STUDENTS: {dept_code}"
-                ws_abs["A1"].font = font_title
-                ws_abs["A1"].alignment = Alignment(horizontal="center", vertical="center")
-                ws_abs.row_dimensions[1].height = 25
-
-                abs_back = ws_abs.cell(row=2, column=1, value=" ◀ BACK TO ROSTER ")
-                abs_back.font = btn_dark_font
-                abs_back.fill = btn_dark_fill
-                abs_back.border = btn_dark_border
-                abs_back.alignment = Alignment(horizontal="center", vertical="center")
-                abs_back.hyperlink = f"#'{detail_sheet_name}'!A1"
-                ws_abs.row_dimensions[2].height = 24
-
-                for c_idx, h in enumerate(det_headers, 1):
-                    cell = ws_abs.cell(row=3, column=c_idx, value=h)
-                    cell.font = font_hdr
-                    cell.fill = primary_fill
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                    cell.border = border_cell
-                ws_abs.row_dimensions[3].height = 22
-
-                a_r_idx = 4
-                for _, row in abs_group.iterrows():
-                    ws_abs.cell(row=a_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
-                    ws_abs.cell(row=a_r_idx, column=2, value=str(row['Name'])).font = font_reg
-                    ws_abs.cell(row=a_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
-                    ws_abs.cell(row=a_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
-                    ws_abs.cell(row=a_r_idx, column=5, value="--:--").font = font_reg
-                    
-                    sc = ws_abs.cell(row=a_r_idx, column=6, value="ABSENT")
-                    sc.font = red_font
-                    sc.fill = red_fill
-
-                    for c in range(1, 7):
-                        c_cell = ws_abs.cell(row=a_r_idx, column=c)
-                        c_cell.border = border_cell
-                        c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
-                    ws_abs.row_dimensions[a_r_idx].height = 20
-                    a_r_idx += 1
-
-                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
-                    ws_abs.column_dimensions[col].width = 22
-
-                late_group = sec_group[sec_group['IsLate'] == 1]
-                ws_late = wb.create_sheet(title=late_sheet_name)
-                ws_late.views.sheetView[0].showGridLines = True
-                ws_late.merge_cells("A1:F1")
-                ws_late["A1"] = f"LATE STUDENTS: {dept_code}"
-                ws_late["A1"].font = font_title
-                ws_late["A1"].alignment = Alignment(horizontal="center", vertical="center")
-                ws_late.row_dimensions[1].height = 25
-
-                late_back = ws_late.cell(row=2, column=1, value=" ◀ BACK TO ROSTER ")
-                late_back.font = btn_dark_font
-                late_back.fill = btn_dark_fill
-                late_back.border = btn_dark_border
-                late_back.alignment = Alignment(horizontal="center", vertical="center")
-                late_back.hyperlink = f"#'{detail_sheet_name}'!A1"
-                ws_late.row_dimensions[2].height = 24
-
-                for c_idx, h in enumerate(det_headers, 1):
-                    cell = ws_late.cell(row=3, column=c_idx, value=h)
-                    cell.font = font_hdr
-                    cell.fill = primary_fill
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                    cell.border = border_cell
-                ws_late.row_dimensions[3].height = 22
-
-                l_r_idx = 4
-                for _, row in late_group.iterrows():
-                    ws_late.cell(row=l_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
-                    ws_late.cell(row=l_r_idx, column=2, value=str(row['Name'])).font = font_reg
-                    ws_late.cell(row=l_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
-                    ws_late.cell(row=l_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
-                    ws_late.cell(row=l_r_idx, column=5, value=str(row['ClockIn'])).font = font_reg
-                    
-                    sc = ws_late.cell(row=l_r_idx, column=6, value=f"LATE ({row['ClockIn']})")
-                    sc.font = amber_font
-                    sc.fill = amber_fill
-
-                    for c in range(1, 7):
-                        c_cell = ws_late.cell(row=l_r_idx, column=c)
-                        c_cell.border = border_cell
-                        c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
-                    ws_late.row_dimensions[l_r_idx].height = 20
-                    l_r_idx += 1
-
-                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
-                    ws_late.column_dimensions[col].width = 22
-
-    if default_sheet.title in wb.sheetnames and default_sheet != ws_master:
-        wb.remove(default_sheet)
-
-    wb.save(output_path)
-
-def generate_excel_report(df, leave_mapping, output_path):
-    df = apply_leave_and_status_filtering(df, leave_mapping)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Daily Attendance Report"
-    ws.views.sheetView[0].showGridLines = True
-
-    primary_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
-    subtotal_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
-    font_title = Font(name="Calibri", size=15, bold=True, color="1E293B")
-    font_dept_hdr = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_col_hdr = Font(name="Calibri", size=11, bold=True, color="1E293B")
-    font_bold = Font(name="Calibri", size=11, bold=True)
-    font_regular = Font(name="Calibri", size=11)
-    font_grand = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
-
-    thin_side = Side(border_style="thin", color="CBD5E1")
-    double_bottom = Side(border_style="double", color="1E293B")
-    border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    border_grand = Border(left=thin_side, right=thin_side, top=thin_side, bottom=double_bottom)
-
-    report_date = df['Date'].iloc[0] if not df.empty else ''
-    full_shift_title = df['ShiftName'].iloc[0] if not df.empty else ''
-
-    ws.merge_cells("A1:F1")
-    ws["A1"] = f"Daily Attendance Report - {full_shift_title} - {report_date}"
-    ws["A1"].font = font_title
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
-
-    current_row = 3
-    subtotal_rows = []
-
-    for parent in PARENT_ORDER:
-        p_data = df[df['ParentDept'] == parent]
-        if p_data.empty:
-            continue
-
-        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=6)
-        cell_p = ws.cell(row=current_row, column=1, value=parent)
-        cell_p.font = font_dept_hdr
-        cell_p.fill = primary_fill
-        cell_p.alignment = Alignment(horizontal="left", vertical="center")
-        ws.row_dimensions[current_row].height = 22
-        current_row += 1
-
-        headers = ["", "Total Strength", "Present", "Absent", "Leave", "Late"]
-        for c_idx, h in enumerate(headers, 1):
-            cell = ws.cell(row=current_row, column=c_idx, value=h)
-            cell.font = font_col_hdr
-            cell.alignment = Alignment(horizontal="center" if c_idx > 1 else "left", vertical="center")
-            cell.border = border_cell
-        ws.row_dimensions[current_row].height = 20
-        current_row += 1
-
-        sec_start_row = current_row
-        for dept_code, sec_group in p_data.groupby('DeptCode'):
-            tot = len(sec_group)
-            pres = sec_group['IsPresent'].sum()
-            leave = sec_group['IsLeave'].sum()
-            absent = max(0, tot - pres - leave)
-            late = sec_group['IsLate'].sum()
-
-            ws.cell(row=current_row, column=1, value=dept_code).font = font_regular
-            ws.cell(row=current_row, column=2, value=tot).font = font_regular
-            ws.cell(row=current_row, column=3, value=pres).font = font_regular
-            ws.cell(row=current_row, column=4, value=absent).font = font_regular
-            ws.cell(row=current_row, column=5, value=leave).font = font_regular
-            ws.cell(row=current_row, column=6, value=late).font = font_regular
-
-            for c in range(1, 7):
-                c_cell = ws.cell(row=current_row, column=c)
-                c_cell.border = border_cell
-                if c > 1:
-                    c_cell.alignment = Alignment(horizontal="center", vertical="center")
-            ws.row_dimensions[current_row].height = 20
-            current_row += 1
-
-        sec_end_row = current_row - 1
-        ws.cell(row=current_row, column=1, value="Subtotal").font = font_bold
-        ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="right", vertical="center")
-        ws.cell(row=current_row, column=2, value=f"=SUM(B{sec_start_row}:B{sec_end_row})").font = font_bold
-        ws.cell(row=current_row, column=3, value=f"=SUM(C{sec_start_row}:C{sec_end_row})").font = font_bold
-        ws.cell(row=current_row, column=4, value=f"=SUM(D{sec_start_row}:D{sec_end_row})").font = font_bold
-        ws.cell(row=current_row, column=5, value=f"=SUM(E{sec_start_row}:E{sec_end_row})").font = font_bold
-        ws.cell(row=current_row, column=6, value=f"=SUM(F{sec_start_row}:F{sec_end_row})").font = font_bold
-
-        for c in range(2, 7):
-            ws.cell(row=current_row, column=c).alignment = Alignment(horizontal="center", vertical="center")
-        for c in range(1, 7):
-            c_cell = ws.cell(row=current_row, column=c)
-            c_cell.border = border_cell
-            c_cell.fill = subtotal_fill
-        ws.row_dimensions[current_row].height = 22
-        subtotal_rows.append(current_row)
-        current_row += 1
-
-    ws.cell(row=current_row, column=1, value="GRAND TOTAL").font = font_grand
-    ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
-    cols = ['B', 'C', 'D', 'E', 'F']
-    for c_idx, col_letter in enumerate(cols, 2):
-        cell_refs = ",".join([f"{col_letter}{r}" for r in subtotal_rows])
-        ws.cell(row=current_row, column=c_idx, value=f"=SUM({cell_refs})").font = font_grand
-        ws.cell(row=current_row, column=c_idx).alignment = Alignment(horizontal="center", vertical="center")
-
-    for c in range(1, 7):
-        c_cell = ws.cell(row=current_row, column=c)
-        c_cell.border = border_grand
-        c_cell.fill = primary_fill
-
-    ws.row_dimensions[current_row].height = 24
-    ws.column_dimensions['A'].width = 38
-    for col in ['B', 'C', 'D', 'E', 'F']:
-        ws.column_dimensions[col].width = 16
-
-    wb.save(output_path)
-
 def generate_all_reports_suite(df, leave_mapping):
     df_filtered = apply_leave_and_status_filtering(df, leave_mapping)
     
@@ -1272,9 +695,6 @@ def generate_all_reports_suite(df, leave_mapping):
     os.makedirs(output_dir, exist_ok=True)
 
     save_records_to_db(df)
-    generate_interactive_master_workbook(df_filtered, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
-    generate_excel_report(df, leave_mapping, os.path.join(output_dir, "Daily_Attendance_Executive_Summary.xlsx"))
-
     return os.path.abspath(output_dir)
 
 def calculate_student_fine_breakdown(emp_df, is_inliving=False):
@@ -1422,7 +842,7 @@ st.markdown(f"""
     <div style="display: flex; justify-content: space-between; align-items: center;">
         <div>
             <h2 style="color: #F8FAFC; margin: 0; font-size: 22px; font-weight: 700;">⚡ CTTI Institutional Command Hub</h2>
-            <p style="color: #94A3B8; margin: 5px 0 0 0; font-size: 13px;">Active Role: <strong style="color: #3B82F6;">{st.session_state['role']}</strong> &nbsp;|&nbsp; Database Engine: <strong style="color: #10B981;">Online & Synchronized</strong></p>
+            <p style="color: #94A3B8; margin: 5px 0 0 0; font-size: 13px;">Active User: <strong style="color: #3B82F6;">{st.session_state.get('username', 'User')}</strong> &nbsp;|&nbsp; Role: <strong style="color: #38BDF8;">{st.session_state['role']}</strong></p>
         </div>
         <div>
             <span style="background: rgba(16, 185, 129, 0.15); color: #34D399; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid rgba(16, 185, 129, 0.3);">🟢 System Secure</span>
@@ -1434,12 +854,20 @@ st.markdown(f"""
 user_role = st.session_state['role']
 
 if user_role == 'Admin':
-    tab1, tab_archive_admin, tab2, tab3, tab4 = st.tabs([
+    tab1, tab_archive_admin, tab2, tab_leave_admin, tab3, tab4 = st.tabs([
         "🚀 Process Daily Log", 
         "📋 Daily Records Archive", 
         "🚨 Warnings, Overrides & Lifecycles", 
+        "📩 Leave Requests Queue", 
         "🔍 Student Profile Search", 
         "💰 Monthly Fine Settlement"
+    ])
+elif user_role == 'Instructor':
+    tab_leave_inst, tab_archive_inst, tab3_inst, tab4_inst = st.tabs([
+        "📩 Submit & Track Leaves",
+        "📋 Daily Records Archive",
+        "🔍 Student Profile Search",
+        "💰 Monthly Fine Summary"
     ])
 else:
     tab_archive, tab2, tab3, tab4 = st.tabs([
@@ -1553,16 +981,22 @@ if user_role == 'Admin':
                 st.error(f"Error processing file: {e}")
 
 # --- TAB ARCHIVE: DAILY RECORDS ARCHIVE ---
-target_archive_tab = tab_archive_admin if user_role == 'Admin' else tab_archive
+target_archive_tab = tab_archive_admin if user_role == 'Admin' else (tab_archive_inst if user_role == 'Instructor' else tab_archive)
 
 with target_archive_tab:
     st.markdown("### 📋 Daily Records & Historical Attendance Archive")
-    st.info("💡 Filter, review, and inspect historical attendance logs across dates, shifts, and sections.")
+    st.info("💡 Filter, review, and inspect historical attendance logs across dates, shifts, and sections. Withdrawn students are automatically excluded.")
 
     df_db = load_all_attendance_logs()
+    profiles_df = load_student_profiles()
+
+    if not df_db.empty and not profiles_df.empty:
+        withdrawn_set = set(profiles_df[profiles_df['status'] == 'Withdrawn']['emp_id'].tolist())
+        if withdrawn_set:
+            df_db = df_db[~df_db['emp_id'].isin(withdrawn_set)]
 
     if df_db.empty:
-        st.warning("No daily records found in the database yet.")
+        st.warning("No active daily records found in the database yet.")
     else:
         all_db_dates = pd.to_datetime(df_db['record_date']).dt.date.tolist()
         min_avail_date = min(all_db_dates)
@@ -1599,7 +1033,7 @@ with target_archive_tab:
                 date_range_logs['dept_code'].isin(selected_sections)
             ]
 
-            st.markdown(f"#### Summary for Date Range: `{start_arch_str}` to `{end_arch_str}`")
+            st.markdown(f"#### Summary for Date Range: `{start_arch_str}` to `{end_arch_str}` (Active Students Only)")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Total Days Logged", filtered_logs['record_date'].nunique())
             m2.metric("Total Logs", len(filtered_logs))
@@ -1611,174 +1045,334 @@ with target_archive_tab:
             st.markdown("#### Detailed Attendance Logs")
             st.dataframe(filtered_logs[['record_date', 'shift_name', 'emp_id', 'name', 'parent_dept', 'sub_dept', 'dept_code', 'clock_in', 'is_present', 'is_absent', 'is_leave', 'is_late', 'excuse_reason']], use_container_width=True)
 
+# --- TAB LEAVE: INSTRUCTOR LEAVE SUBMISSION & TRACKING ---
+target_leave_inst_tab = tab_leave_inst if user_role == 'Instructor' else None
+
+if target_leave_inst_tab or user_role == 'Admin':
+    leave_tab_context = target_leave_inst_tab if user_role == 'Instructor' else tab_leave_admin
+    with leave_tab_context:
+        if user_role == 'Instructor':
+            st.markdown(f"### 📩 Instructor Leave Request Portal — Welcome, {st.session_state['username']}")
+            st.info("💡 Submit multi-day medical or personal leave requests for students. You can track whether they are approved or rejected in real-time.")
+
+            with st.form("instructor_leave_form"):
+                df_db_l = load_all_attendance_logs()
+                if df_db_l.empty:
+                    st.warning("No student records available in database to request leave for.")
+                else:
+                    all_studs = df_db_l[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
+                    stud_opts = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_studs.iterrows()]
+                    
+                    sel_stud_str = st.selectbox("Select Student:", stud_opts)
+                    
+                    c_l1, c_l2 = st.columns(2)
+                    with c_l1:
+                        start_l_date = st.date_input("Leave Start Date", value=date.today())
+                    with c_l2:
+                        end_l_date = st.date_input("Leave End Date", value=date.today())
+
+                    leave_type = st.selectbox("Leave Category:", ["Medical Leave", "Urgent Personal Leave", "Official Duty / Event", "Family Emergency"])
+                    reason_note = st.text_area("Reason & Verification Proof Reference:", placeholder="e.g., Verified via medical slip #402 / Parent phone call confirmation")
+
+                    submit_l_req = st.form_submit_button("🚀 Submit Multi-Day Leave Request", type="primary", use_container_width=True)
+
+                    if submit_l_req:
+                        if start_l_date > end_l_date:
+                            st.error("❌ Start Date cannot be after End Date.")
+                        else:
+                            s_id = normalize_emp_id(sel_stud_str.split(" - ")[0])
+                            s_name = sel_stud_str.split(" - ")[1].split(" (")[0]
+                            s_dept = sel_stud_str.split("(")[1].split(")")[0]
+
+                            conn_l = sqlite3.connect(DB_FILE)
+                            c_l = conn_l.cursor()
+                            c_l.execute('''
+                                INSERT INTO leave_requests (emp_id, student_name, dept_code, start_date, end_date, leave_type, reason, instructor_name, status, submitted_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+                            ''', (s_id, s_name, s_dept, start_l_date.strftime('%Y-%m-%d'), end_l_date.strftime('%Y-%m-%d'), leave_type, reason_note, st.session_state['username'], datetime.now().strftime('%Y-%m-%d %H:%M')))
+                            conn_l.commit()
+                            conn_l.close()
+                            st.success(f"✅ Leave request for {s_name} ({start_l_date} to {end_l_date}) submitted successfully and is pending Admin review!")
+                            st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 📊 Your Submitted Requests Status Tracker")
+            conn_q = sqlite3.connect(DB_FILE)
+            my_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE instructor_name = ? ORDER BY request_id DESC", conn_q, params=(st.session_state['username'],))
+            conn_q.close()
+
+            if my_reqs.empty:
+                st.info("You have not submitted any leave requests yet.")
+            else:
+                st.dataframe(my_reqs[['request_id', 'emp_id', 'student_name', 'dept_code', 'start_date', 'end_date', 'leave_type', 'reason', 'status', 'admin_remarks', 'submitted_at']], use_container_width=True)
+
 # --- TAB 2: WARNINGS, OVERRIDES & STUDENT LIFECYCLE PORTAL ---
-with tab2:
-    if user_role == 'Admin':
-        st.markdown("### 🚨 Warnings, Overrides & Student Lifecycle Management")
-    else:
-        st.markdown("### 🚨 Disciplinary Warning & Student Status View (Read-Only)")
-
-    df_db = load_all_attendance_logs()
-    profiles_df = load_student_profiles()
-
-    if df_db.empty:
-        st.info("No attendance records in history database yet.")
-    else:
-        abs_summary = df_db.groupby(['emp_id', 'name', 'dept_code', 'sub_dept']).agg(
-            Total_Days=('record_date', 'nunique'),
-            Total_Absent=('is_absent', 'sum'),
-            Total_Late=('is_late', 'sum'),
-            Total_Leave=('is_leave', 'sum')
-        ).reset_index()
-
-        if not profiles_df.empty:
-            abs_summary = abs_summary.merge(profiles_df[['emp_id', 'status', 'withdrawal_date', 'reinstated_date']], on='emp_id', how='left')
-            abs_summary['status'] = abs_summary['status'].fillna('Active')
-        else:
-            abs_summary['status'] = 'Active'
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Logged Days", df_db['record_date'].nunique())
-        c2.metric("1st Warning (4+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['status'] == 'Active')]))
-        c3.metric("2nd Warning (8+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 8) & (abs_summary['status'] == 'Active')]))
-        c4.metric("Total Withdrawn", len(abs_summary[abs_summary['status'] == 'Withdrawn']))
-
-        st.markdown("---")
-        st.markdown("#### 🚩 Personnel Status & Roster")
-
-        warning_filter = st.radio("Filter Stage:", ["All Active Personnel", "Withdrawn Students", "1st Warning (4-7 Abs)", "2nd Warning (8-11 Abs)", "Withdrawal Notice (12+ Abs)"], key="warning_radio_view" if user_role == 'Viewer' else "warning_radio_adm")
-        
-        if warning_filter == "Withdrawn Students":
-            flagged = abs_summary[abs_summary['status'] == 'Withdrawn']
-        elif warning_filter == "1st Warning (4-7 Abs)":
-            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 4) & (abs_summary['Total_Absent'] < 8)]
-        elif warning_filter == "2nd Warning (8-11 Abs)":
-            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 8) & (abs_summary['Total_Absent'] < 12)]
-        elif warning_filter == "Withdrawal Notice (12+ Abs)":
-            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 12)]
-        else:
-            flagged = abs_summary[abs_summary['status'] == 'Active']
-
-        sorted_flagged = flagged.sort_values(by='Total_Absent', ascending=False)
-        st.dataframe(sorted_flagged, use_container_width=True)
-
+if user_role in ['Admin', 'Viewer']:
+    with tab2:
         if user_role == 'Admin':
+            st.markdown("### 🚨 Warnings, Overrides & Student Lifecycle Management")
+        else:
+            st.markdown("### 🚨 Disciplinary Warning & Student Status View (Read-Only)")
+
+        df_db = load_all_attendance_logs()
+        profiles_df = load_student_profiles()
+
+        if df_db.empty:
+            st.info("No attendance records in history database yet.")
+        else:
+            abs_summary = df_db.groupby(['emp_id', 'name', 'dept_code', 'sub_dept']).agg(
+                Total_Days=('record_date', 'nunique'),
+                Total_Absent=('is_absent', 'sum'),
+                Total_Late=('is_late', 'sum'),
+                Total_Leave=('is_leave', 'sum')
+            ).reset_index()
+
+            if not profiles_df.empty:
+                abs_summary = abs_summary.merge(profiles_df[['emp_id', 'status', 'withdrawal_date', 'reinstated_date']], on='emp_id', how='left')
+                abs_summary['status'] = abs_summary['status'].fillna('Active')
+            else:
+                abs_summary['status'] = 'Active'
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Logged Days", df_db['record_date'].nunique())
+            c2.metric("1st Warning (4+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['status'] == 'Active')]))
+            c3.metric("2nd Warning (8+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 8) & (abs_summary['status'] == 'Active')]))
+            c4.metric("Total Withdrawn", len(abs_summary[abs_summary['status'] == 'Withdrawn']))
+
             st.markdown("---")
-            st.markdown("### 🎓 Student Lifecycle Manager (Active / Withdrawn)")
-            st.caption("Select a student to toggle their status between Active and Withdrawn. Withdrawn students are frozen from attendance counts and fine bills.")
+            st.markdown("#### 🚩 Personnel Status & Roster")
 
-            all_stud_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Status: {r['status']}]" for _, r in abs_summary.iterrows()]
-            selected_lifecycle_str = st.selectbox("Select Student for Lifecycle Update:", all_stud_options, key="lifecycle_student_select")
-
-            if selected_lifecycle_str:
-                sel_life_id = normalize_emp_id(selected_lifecycle_str.split(" - ")[0])
-                current_st_row = abs_summary[abs_summary['emp_id'] == sel_life_id].iloc[0]
-                current_status = current_st_row['status']
-
-                col_lc1, col_lc2 = st.columns(2)
-                with col_lc1:
-                    st.write(f"**Current Status:** `{current_status}`")
-                    if current_status == 'Withdrawn':
-                        st.write(f"**Withdrawn On:** `{current_st_row.get('withdrawal_date', 'N/A')}`")
-                    else:
-                        st.write(f"**Reinstated/Active Since:** `{current_st_row.get('reinstated_date', 'Registry Date')}`")
-
-                with col_lc2:
-                    new_target_status = st.selectbox("Change Status To:", ["Active", "Withdrawn"], index=0 if current_status == 'Active' else 1, key="new_status_target")
-                    status_date = st.date_input("Effective Date", value=date.today(), key="status_eff_date")
-
-                if st.button("🔄 Update Student Lifecycle Status", type="primary", use_container_width=True):
-                    update_student_status(sel_life_id, new_target_status, status_date.strftime('%Y-%m-%d'))
-                    st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}**!")
-                    st.rerun()
-
-            st.markdown("---")
-            st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
-            st.caption("Use this section to correct individual student log entries or record direct leaves.")
-
-            all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
-            student_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_students.iterrows()]
+            warning_filter = st.radio("Filter Stage:", ["All Active Personnel", "Withdrawn Students", "1st Warning (4-7 Abs)", "2nd Warning (8-11 Abs)", "Withdrawal Notice (12+ Abs)"], key="warning_radio_view" if user_role == 'Viewer' else "warning_radio_adm")
             
-            selected_student_str = st.selectbox("Select Student:", student_options, key="manual_override_student")
-            
-            if selected_student_str:
-                sel_emp_id = normalize_emp_id(selected_student_str.split(" - ")[0])
-                student_records = df_db[df_db['emp_id'] == sel_emp_id].sort_values(by='record_date', ascending=False)
+            if warning_filter == "Withdrawn Students":
+                flagged = abs_summary[abs_summary['status'] == 'Withdrawn']
+            elif warning_filter == "1st Warning (4-7 Abs)":
+                flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 4) & (abs_summary['Total_Absent'] < 8)]
+            elif warning_filter == "2nd Warning (8-11 Abs)":
+                flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 8) & (abs_summary['Total_Absent'] < 12)]
+            elif warning_filter == "Withdrawal Notice (12+ Abs)":
+                flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 12)]
+            else:
+                flagged = abs_summary[abs_summary['status'] == 'Active']
 
-                if not student_records.empty:
-                    st.markdown("##### Change Existing Log Entry")
-                    record_dates_shifts = student_records[['record_date', 'shift_name', 'is_present', 'is_absent', 'is_leave', 'clock_in']].copy()
-                    
-                    date_shift_opts = [f"{r['record_date']} | {r['shift_name']} (Current: {'Present' if r['is_present']==1 else ('Leave' if r['is_leave']==1 else 'Absent')})" for _, r in record_dates_shifts.iterrows()]
-                    selected_date_opt = st.selectbox("Select Date & Shift Record to Update:", date_shift_opts)
-                    
-                    target_date = selected_date_opt.split(" | ")[0].strip()
-                    target_shift = selected_date_opt.split(" | ")[1].split(" (")[0].strip()
-                    
-                    col_ov1, col_ov2, col_ov3 = st.columns(3)
-                    with col_ov1:
-                        target_status = st.selectbox("Set New Status:", ["Present", "Leave", "Absent", "Late"], key="target_status")
-                    with col_ov2:
-                        target_time = st.text_input("Clock-In Time (HH:MM):", value="08:00" if target_status in ["Present", "Late"] else "", key="target_time")
-                    with col_ov3:
-                        override_reason = st.text_input("Reason / Note:", value="Manual Correction" if target_status == "Present" else "Reported by Class Rep", key="target_reason")
+            sorted_flagged = flagged.sort_values(by='Total_Absent', ascending=False)
+            st.dataframe(sorted_flagged, use_container_width=True)
 
-                    if st.button("💾 Apply Manual Override", type="primary", use_container_width=True):
-                        manual_attendance_override(sel_emp_id, target_date, target_shift, target_status, target_time, override_reason)
-                        st.success(f"Successfully updated record for Student {sel_emp_id} on {target_date} ({target_shift}) to {target_status}!")
+            if user_role == 'Admin':
+                st.markdown("---")
+                st.markdown("### 🎓 Student Lifecycle Manager (Active / Withdrawn)")
+                st.caption("Select a student to toggle their status between Active and Withdrawn. Withdrawn students are frozen from attendance counts and fine bills.")
+
+                all_stud_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Status: {r['status']}]" for _, r in abs_summary.iterrows()]
+                selected_lifecycle_str = st.selectbox("Select Student for Lifecycle Update:", all_stud_options, key="lifecycle_student_select")
+
+                if selected_lifecycle_str:
+                    sel_life_id = normalize_emp_id(selected_lifecycle_str.split(" - ")[0])
+                    current_st_row = abs_summary[abs_summary['emp_id'] == sel_life_id].iloc[0]
+                    current_status = current_st_row['status']
+
+                    col_lc1, col_lc2 = st.columns(2)
+                    with col_lc1:
+                        st.write(f"**Current Status:** `{current_status}`")
+                        if current_status == 'Withdrawn':
+                            st.write(f"**Withdrawn On:** `{current_st_row.get('withdrawal_date', 'N/A')}`")
+                        else:
+                            st.write(f"**Reinstated/Active Since:** `{current_st_row.get('reinstated_date', 'Registry Date')}`")
+
+                    with col_lc2:
+                        new_target_status = st.selectbox("Change Status To:", ["Active", "Withdrawn"], index=0 if current_status == 'Active' else 1, key="new_status_target")
+                        status_date = st.date_input("Effective Date", value=date.today(), key="status_eff_date")
+
+                    if st.button("🔄 Update Student Lifecycle Status", type="primary", use_container_width=True):
+                        update_student_status(sel_life_id, new_target_status, status_date.strftime('%Y-%m-%d'))
+                        st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}**!")
                         st.rerun()
 
-            st.markdown("---")
-            st.markdown("### ⚡ Bulk Section Attendance Override (Power Outage Mode)")
-            with st.form("bulk_override_form"):
-                c_b1, c_b2, c_b3 = st.columns(3)
-                with c_b1:
-                    bulk_date = st.date_input("Target Date", value=date.today(), key="bulk_date_input")
-                with c_b2:
-                    all_shifts_bulk = sorted(df_db['shift_name'].unique().tolist()) if not df_db.empty else ['First Shift']
-                    bulk_shift = st.selectbox("Target Shift", all_shifts_bulk, key="bulk_shift_input")
-                with c_b3:
-                    all_secs_bulk = sorted(df_db['dept_code'].unique().tolist()) if not df_db.empty else []
-                    bulk_section = st.selectbox("Target Section", all_secs_bulk, key="bulk_section_input")
+                st.markdown("---")
+                st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
+                st.caption("Use this section to correct individual student log entries or record direct leaves.")
 
-                col_bo1, col_bo2 = st.columns(2)
-                with col_bo1:
-                    bulk_status = st.selectbox("New Status for Section", ["Present", "Late", "Leave", "Absent"], key="bulk_status_input")
-                with col_bo2:
-                    bulk_time = st.text_input("Default Clock-In Time (HH:MM)", value="08:00", key="bulk_time_input")
+                all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
+                student_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_students.iterrows()]
+                
+                selected_student_str = st.selectbox("Select Student:", student_options, key="manual_override_student")
+                
+                if selected_student_str:
+                    sel_emp_id = normalize_emp_id(selected_student_str.split(" - ")[0])
+                    student_records = df_db[df_db['emp_id'] == sel_emp_id].sort_values(by='record_date', ascending=False)
 
-                bulk_reason = st.text_input("Reason / Note", value="Power Outage - Bulk Manual Verification")
+                    if not student_records.empty:
+                        st.markdown("##### Change Existing Log Entry")
+                        record_dates_shifts = student_records[['record_date', 'shift_name', 'is_present', 'is_absent', 'is_leave', 'clock_in']].copy()
+                        
+                        date_shift_opts = [f"{r['record_date']} | {r['shift_name']} (Current: {'Present' if r['is_present']==1 else ('Leave' if r['is_leave']==1 else 'Absent')})" for _, r in record_dates_shifts.iterrows()]
+                        selected_date_opt = st.selectbox("Select Date & Shift Record to Update:", date_shift_opts)
+                        
+                        target_date = selected_date_opt.split(" | ")[0].strip()
+                        target_shift = selected_date_opt.split(" | ")[1].split(" (")[0].strip()
+                        
+                        col_ov1, col_ov2, col_ov3 = st.columns(3)
+                        with col_ov1:
+                            target_status = st.selectbox("Set New Status:", ["Present", "Leave", "Absent", "Late"], key="target_status")
+                        with col_ov2:
+                            target_time = st.text_input("Clock-In Time (HH:MM):", value="08:00" if target_status in ["Present", "Late"] else "", key="target_time")
+                        with col_ov3:
+                            override_reason = st.text_input("Reason / Note:", value="Manual Correction" if target_status == "Present" else "Reported by Class Rep", key="target_reason")
 
-                submit_bulk = st.form_submit_button("🚀 Apply Bulk Override to Entire Section", type="primary", use_container_width=True)
+                        if st.button("💾 Apply Manual Override", type="primary", use_container_width=True):
+                            manual_attendance_override(sel_emp_id, target_date, target_shift, target_status, target_time, override_reason)
+                            st.success(f"Successfully updated record for Student {sel_emp_id} on {target_date} ({target_shift}) to {target_status}!")
+                            st.rerun()
 
-                if submit_bulk:
-                    target_d_str = bulk_date.strftime('%Y-%m-%d')
-                    conn = sqlite3.connect(DB_FILE)
-                    c = conn.cursor()
-                    
-                    is_pres = 1 if bulk_status in ['Present', 'Late'] else 0
-                    is_abs = 1 if bulk_status == 'Absent' else 0
-                    is_lea = 1 if bulk_status == 'Leave' else 0
-                    is_lat = 1 if bulk_status == 'Late' else 0
-                    
-                    c.execute('''
-                        UPDATE attendance_logs
-                        SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
-                        WHERE TRIM(dept_code) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
-                    ''', (is_pres, is_abs, is_lea, is_lat, str(bulk_time).strip(), str(bulk_reason).strip(), str(bulk_section).strip(), target_d_str, str(bulk_shift).strip()))
-                    
-                    affected_rows = c.rowcount
-                    conn.commit()
-                    conn.close()
-                    
-                    if affected_rows > 0:
-                        st.success(f"Successfully updated **{affected_rows} students** in section `{bulk_section}` for {target_d_str} ({bulk_shift}) to `{bulk_status}`!")
-                        st.rerun()
-                    else:
-                        st.warning(f"⚠️ No matching records found for section `{bulk_section}` on `{target_d_str}` under shift `{bulk_shift}`.")
+                st.markdown("---")
+                st.markdown("### ⚡ Bulk Section Attendance Override (Power Outage Mode)")
+                with st.form("bulk_override_form"):
+                    c_b1, c_b2, c_b3 = st.columns(3)
+                    with c_b1:
+                        bulk_date = st.date_input("Target Date", value=date.today(), key="bulk_date_input")
+                    with c_b2:
+                        all_shifts_bulk = sorted(df_db['shift_name'].unique().tolist()) if not df_db.empty else ['First Shift']
+                        bulk_shift = st.selectbox("Target Shift", all_shifts_bulk, key="bulk_shift_input")
+                    with c_b3:
+                        all_secs_bulk = sorted(df_db['dept_code'].unique().tolist()) if not df_db.empty else []
+                        bulk_section = st.selectbox("Target Section", all_secs_bulk, key="bulk_section_input")
+
+                    col_bo1, col_bo2 = st.columns(2)
+                    with col_bo1:
+                        bulk_status = st.selectbox("New Status for Section", ["Present", "Late", "Leave", "Absent"], key="bulk_status_input")
+                    with col_bo2:
+                        bulk_time = st.text_input("Default Clock-In Time (HH:MM)", value="08:00", key="bulk_time_input")
+
+                    bulk_reason = st.text_input("Reason / Note", value="Power Outage - Bulk Manual Verification")
+
+                    submit_bulk = st.form_submit_button("🚀 Apply Bulk Override to Entire Section", type="primary", use_container_width=True)
+
+                    if submit_bulk:
+                        target_d_str = bulk_date.strftime('%Y-%m-%d')
+                        conn = sqlite3.connect(DB_FILE)
+                        c = conn.cursor()
+                        
+                        is_pres = 1 if bulk_status in ['Present', 'Late'] else 0
+                        is_abs = 1 if bulk_status == 'Absent' else 0
+                        is_lea = 1 if bulk_status == 'Leave' else 0
+                        is_lat = 1 if bulk_status == 'Late' else 0
+                        
+                        c.execute('''
+                            UPDATE attendance_logs
+                            SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
+                            WHERE TRIM(dept_code) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
+                        ''', (is_pres, is_abs, is_lea, is_lat, str(bulk_time).strip(), str(bulk_reason).strip(), str(bulk_section).strip(), target_d_str, str(bulk_shift).strip()))
+                        
+                        affected_rows = c.rowcount
+                        conn.commit()
+                        conn.close()
+                        
+                        if affected_rows > 0:
+                            st.success(f"Successfully updated **{affected_rows} students** in section `{bulk_section}` for {target_d_str} ({bulk_shift}) to `{bulk_status}`!")
+                            st.rerun()
+                        else:
+                            st.warning(f"⚠️ No matching records found for section `{bulk_section}` on `{target_d_str}` under shift `{bulk_shift}`.")
+
+
+# --- TAB LEAVE ADMIN: PENDING LEAVE REQUESTS & CONFLICT VALIDATION ---
+if user_role == 'Admin':
+    with tab_leave_admin:
+        st.markdown("### 📩 Instructor Leave Requests Queue & Validation Hub")
+        st.info("💡 Review pending multi-day leave requests submitted by instructors. The system automatically cross-references records to detect clock-in conflicts.")
+
+        conn_adm = sqlite3.connect(DB_FILE)
+        pending_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE status = 'Pending' ORDER BY request_id ASC", conn_adm)
+        all_logs_chk = pd.read_sql_query("SELECT * FROM attendance_logs", conn_adm)
+        conn_adm.close()
+
+        if pending_reqs.empty:
+            st.success("🎉 No pending leave requests in the queue!")
+        else:
+            for _, req in pending_reqs.iterrows():
+                r_id = req['request_id']
+                e_id = normalize_emp_id(req['emp_id'])
+                s_name = req['student_name']
+                sec = req['dept_code']
+                s_date = req['start_date']
+                e_date = req['end_date']
+                l_type = req['leave_type']
+                reason = req['reason']
+                inst = req['instructor_name']
+                sub_at = req['submitted_at']
+
+                # Conflict Check: Did student clock in on any of those dates?
+                conflict_found = False
+                conflict_dates = []
+                if not all_logs_chk.empty:
+                    d_cur = datetime.strptime(s_date, '%Y-%m-%d')
+                    d_end = datetime.strptime(e_date, '%Y-%m-%d')
+                    while d_cur <= d_end:
+                        chk_str = d_cur.strftime('%Y-%m-%d')
+                        match_row = all_logs_chk[(all_logs_chk['emp_id'] == e_id) & (all_logs_chk['record_date'] == chk_str) & (all_logs_chk['is_present'] == 1)]
+                        if not match_row.empty:
+                            conflict_found = True
+                            conflict_dates.append(chk_str)
+                        d_cur += timedelta(days=1)
+
+                with st.container():
+                    col_box1, col_box2 = st.columns([3, 1])
+                    with col_box1:
+                        st.markdown(f"#### 🎓 Request #{r_id}: {s_name} (`{e_id}`) — Section `{sec}`")
+                        st.write(f"**Dates:** `{s_date}` to `{e_date}` &nbsp;|&nbsp; **Category:** `{l_type}`")
+                        st.write(f"**Reason / Proof:** {reason}")
+                        st.write(f"**Submitted By Instructor:** `{inst}` at `{sub_at}`")
+
+                        if conflict_found:
+                            st.error(f"⚠️ **CLOCK-IN CONFLICT DETECTED:** Student clocked in as PRESENT on: `{', '.join(conflict_dates)}`. Approving will convert these to excused leave.")
+                        else:
+                            st.success("✅ No clock-In conflicts found for this date range.")
+
+                    with col_box2:
+                        admin_note = st.text_input("Admin Remarks", key=f"adm_rem_{r_id}")
+                        c_app, c_rej = st.columns(2)
+                        with c_app:
+                            if st.button("✅ Approve", key=f"app_{r_id}", use_container_width=True):
+                                # Update leave_requests status
+                                conn_up = sqlite3.connect(DB_FILE)
+                                c_up = conn_up.cursor()
+                                c_up.execute("UPDATE leave_requests SET status = 'Approved', admin_remarks = ? WHERE request_id = ?", (admin_note or "Approved by Admin", r_id))
+                                
+                                # Apply leave across date range in attendance_logs
+                                d_cur = datetime.strptime(s_date, '%Y-%m-%d')
+                                d_end = datetime.strptime(e_date, '%Y-%m-%d')
+                                while d_cur <= d_end:
+                                    chk_str = d_cur.strftime('%Y-%m-%d')
+                                    c_up.execute('''
+                                        UPDATE attendance_logs
+                                        SET is_absent = 0, is_leave = 1, excuse_reason = ?
+                                        WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?)
+                                    ''', (f"Approved Leave ({l_type}): {reason}", e_id, chk_str))
+                                    conn_up.commit()
+                                    d_cur += timedelta(days=1)
+                                conn_up.close()
+                                st.success(f"Request #{r_id} Approved & Attendance Logs Updated!")
+                                st.rerun()
+
+                        with c_rej:
+                            if st.button("❌ Reject", key=f"rej_{r_id}", use_container_width=True):
+                                conn_up = sqlite3.connect(DB_FILE)
+                                c_up = conn_up.cursor()
+                                c_up.execute("UPDATE leave_requests SET status = 'Rejected', admin_remarks = ? WHERE request_id = ?", (admin_note or "Rejected by Admin", r_id))
+                                conn_up.commit()
+                                conn_up.close()
+                                st.warning(f"Request #{r_id} Rejected.")
+                                st.rerun()
+                    st.markdown("---")
 
 # --- TAB 3: STUDENT PROFILE SEARCH ---
-with tab3:
+if user_role == 'Admin':
+    current_profile_tab = tab3
+elif user_role == 'Instructor':
+    current_profile_tab = tab3_inst
+else:
+    current_profile_tab = tab3
+
+with current_profile_tab:
     st.markdown("### 🔍 Individual Student Attendance Performance Profile")
     
     df_db = load_all_attendance_logs()
@@ -1786,7 +1380,7 @@ with tab3:
 
     if not df_db.empty:
         emp_list = sorted(df_db['emp_id'].unique().tolist())
-        selected_emp = st.selectbox("Select Employee / Student ID:", emp_list, key="search_emp_select")
+        selected_emp = st.selectbox("Select Employee / Student ID:", emp_list, key=f"{user_role}_search_emp_select")
 
         if selected_emp:
             norm_sel_emp = normalize_emp_id(selected_emp)
@@ -1831,11 +1425,19 @@ with tab3:
                 display_cols = ['record_date', 'shift_name', 'clock_in', 'is_present', 'is_absent', 'is_late', 'is_leave', 'excuse_reason']
                 st.dataframe(emp_records[display_cols], use_container_width=True)
 
+
 # --- TAB 4: MONTHLY FINE SETTLEMENT ENGINE ---
-with tab4:
+if user_role == 'Admin':
+    current_fine_tab = tab4
+elif user_role == 'Instructor':
+    current_fine_tab = tab4_inst
+else:
+    current_fine_tab = tab4
+
+with current_fine_tab:
     st.markdown("### 💰 Monthly Fine Settlement & Disciplinary Billing Engine")
-    if user_role == 'Viewer':
-        st.info("👀 **Viewer Mode:** You are viewing calculated fine summaries in read-only mode. Withdrawn students are automatically excluded from fines.")
+    if user_role in ['Viewer', 'Instructor']:
+        st.info("👀 **Read-Only Mode:** You are viewing calculated fine summaries. Withdrawn students are automatically excluded from fines.")
 
     df_db = load_all_attendance_logs()
     profiles_df = load_student_profiles()
@@ -1847,7 +1449,7 @@ with tab4:
         
         sections_list = sorted(df_db['dept_code'].unique().tolist())
         with c_sec:
-            selected_section = st.selectbox("Select Class / Section:", sections_list, key="fine_sec_select_viewer" if user_role == 'Viewer' else "fine_sec_select")
+            selected_section = st.selectbox("Select Class / Section:", sections_list, key=f"{user_role}_fine_sec_select")
             
         today = date.today()
         if today.day >= 20:
@@ -1864,9 +1466,9 @@ with tab4:
             default_end = date(today.year, today.month, 19)
 
         with c_start:
-            start_d = st.date_input("Start Date (Cycle)", default_start, key="start_d_view" if user_role == 'Viewer' else "start_d_admin")
+            start_d = st.date_input("Start Date (Cycle)", default_start, key=f"{user_role}_start_d")
         with c_end:
-            end_d = st.date_input("End Date (Cycle)", default_end, key="end_d_view" if user_role == 'Viewer' else "end_d_admin")
+            end_d = st.date_input("End Date (Cycle)", default_end, key=f"{user_role}_end_d")
 
         start_str = start_d.strftime('%Y-%m-%d')
         end_str = end_d.strftime('%Y-%m-%d')
@@ -2115,3 +1717,20 @@ with tab4:
                         "\">🖨️ Print Section Fine Sheet (A4 Portrait)</button>"
                     )
                     st.components.v1.html(print_fine_script, height=60)
+            else:
+                fin_summary_data = []
+                for _, st_row in active_unique_students.iterrows():
+                    e_id = normalize_emp_id(st_row['emp_id'])
+                    e_name = str(st_row['name']).strip()
+                    emp_period_df = sec_logs[sec_logs['emp_id'] == e_id]
+                    abs_cnt, late_cnt, absent_fine, late_fine = calculate_student_fine_breakdown(emp_period_df, False)
+                    auto_fine = absent_fine + late_fine
+                    fin_summary_data.append({
+                        'ID': e_id,
+                        'Name': e_name,
+                        'Absentees': abs_cnt,
+                        'Late': late_cnt,
+                        'Auto Fine (Rs.)': auto_fine,
+                        'Warnings': warning_map.get(e_id, "Normal")
+                    })
+                st.dataframe(pd.DataFrame(fin_summary_data), use_container_width=True)

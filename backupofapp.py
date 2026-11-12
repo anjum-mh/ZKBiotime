@@ -204,17 +204,24 @@ def normalize_emp_id(val):
 
 def load_all_attendance_logs():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+    except Exception:
+        df = pd.DataFrame()
     conn.close()
-    if not df.empty:
+    
+    if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
 def load_student_profiles():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM student_profiles", conn)
+    try:
+        df = pd.read_sql_query("SELECT * FROM student_profiles", conn)
+    except Exception:
+        df = pd.DataFrame(columns=['emp_id', 'name', 'dept_code', 'status', 'withdrawal_date', 'reinstated_date'])
     conn.close()
-    if not df.empty:
+    if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
@@ -526,10 +533,13 @@ def apply_leave_and_status_filtering(df, leave_mapping):
     df = df.copy()
     
     profiles = load_student_profiles()
-    if not profiles.empty:
+    if not profiles.empty and 'status' in profiles.columns and 'emp_id' in profiles.columns:
         withdrawn_ids = set(profiles[profiles['status'] == 'Withdrawn']['emp_id'].tolist())
         if withdrawn_ids:
-            df = df[~df['emp_id'].isin(withdrawn_ids)]
+            if 'EmpID' in df.columns:
+                df = df[~df['EmpID'].isin(withdrawn_ids)]
+            elif 'emp_id' in df.columns:
+                df = df[~df['emp_id'].isin(withdrawn_ids)]
 
     df['IsLeave'] = 0
     df['IsAbsent'] = 1 - df['IsPresent']
