@@ -15,7 +15,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- HELPER TO CONVERT LOCAL IMAGES TO BASE64 FOR CSS BACKGROUNDS ---
 def get_base64_image(image_path):
     if os.path.exists(image_path):
         with open(image_path, "rb") as f:
@@ -25,7 +24,6 @@ def get_base64_image(image_path):
 
 campus_bg_b64 = get_base64_image("ctti_campus.jpg")
 
-# --- INJECT CINEMATIC GLASSMORPHISM & CUSTOM THEME CSS ---
 st.markdown(f"""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -39,7 +37,6 @@ st.markdown(f"""
         color: #F8FAFC;
     }}
     
-    /* Cinematic Login Background Overlay */
     .login-bg-overlay {{
         position: fixed;
         top: 0;
@@ -52,7 +49,6 @@ st.markdown(f"""
         z-index: -1;
     }}
     
-    /* Sleek Glassmorphism Login Container */
     .login-card {{
         background: rgba(30, 41, 59, 0.80);
         backdrop-filter: blur(20px);
@@ -63,7 +59,6 @@ st.markdown(f"""
         box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
     }}
     
-    /* Modern Pill Tabs Styling */
     .stTabs [data-baseweb="tab-list"] {{
         gap: 8px;
         background-color: #1E293B;
@@ -85,7 +80,6 @@ st.markdown(f"""
         box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
     }}
     
-    /* Custom Buttons */
     .stButton button {{
         border-radius: 10px;
         font-weight: 600;
@@ -97,7 +91,6 @@ st.markdown(f"""
         box-shadow: 0 6px 15px rgba(59, 130, 246, 0.3);
     }}
     
-    /* Sidebar Styling */
     [data-testid="stSidebar"] {{
         background-color: #0B0F19;
         border-right: 1px solid #1E293B;
@@ -107,7 +100,6 @@ st.markdown(f"""
 
 DB_FILE = "attendance_history.db"
 
-# --- HIERARCHY MAPPING ---
 PREFIX_MAP = {
     'MTCM': ('Industrial Machinery and Maintenance Technologies Department', 'Mechanical Technology CMT'),
     'HVAC': ('Industrial Machinery and Maintenance Technologies Department', 'HVACR'),
@@ -129,7 +121,6 @@ PARENT_ORDER = [
     'Computing and Digital Technologies Department'
 ]
 
-# --- DATABASE SETUP & MIGRATION ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -160,6 +151,17 @@ def init_db():
         ON attendance_logs (emp_id, record_date, shift_name)
     ''')
     
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS student_profiles (
+            emp_id TEXT PRIMARY KEY,
+            name TEXT,
+            dept_code TEXT,
+            status TEXT DEFAULT 'Active',
+            withdrawal_date TEXT,
+            reinstated_date TEXT
+        )
+    ''')
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -208,7 +210,29 @@ def load_all_attendance_logs():
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
     return df
 
-# --- SECURE AUTHENTICATION GATEWAY WITH CINEMATIC LOGIN UI ---
+def load_student_profiles():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM student_profiles", conn)
+    conn.close()
+    if not df.empty:
+        df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
+    return df
+
+def update_student_status(emp_id, status, date_str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    norm_id = normalize_emp_id(emp_id)
+    if status == 'Withdrawn':
+        c.execute('''
+            UPDATE student_profiles SET status = ?, withdrawal_date = ? WHERE TRIM(emp_id) = TRIM(?)
+        ''', (status, date_str, norm_id))
+    else:
+        c.execute('''
+            UPDATE student_profiles SET status = ?, reinstated_date = ? WHERE TRIM(emp_id) = TRIM(?)
+        ''', (status, date_str, norm_id))
+    conn.commit()
+    conn.close()
+
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
     st.session_state['role'] = None
@@ -224,8 +248,8 @@ if not st.session_state['authenticated']:
             
         st.markdown("""
         <div style="text-align: center; margin-bottom: 20px;">
-            <h1 style="font-size: 26px; font-weight: 700; color: #F8FAFC; margin-bottom: 4px;">Welcome to Attendance Portal</h1>
-            <p style="color: #94A3B8; font-size: 13px; font-weight: 500;">Enterprise Attendance & Disciplinary Intelligence Suite, Proudly developed by ICT Dept.</p>
+            <h1 style="font-size: 26px; font-weight: 700; color: #F8FAFC; margin-bottom: 4px;">CTTI Portal</h1>
+            <p style="color: #94A3B8; font-size: 13px; font-weight: 500;">Enterprise Attendance & Disciplinary Intelligence Suite</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -253,7 +277,6 @@ if not st.session_state['authenticated']:
                     st.error("❌ Invalid security key. Access denied.")
     st.stop()
 
-# --- SIDEBAR BRAND ANCHOR & SETTINGS ---
 with st.sidebar:
     if os.path.exists("ctti_logo.png"):
         st.image("ctti_logo.png", width=90)
@@ -293,6 +316,17 @@ def save_records_to_db(df):
     c = conn.cursor()
     for _, r in df.iterrows():
         norm_id = normalize_emp_id(r['EmpID'])
+        name = str(r['Name']).strip()
+        dept_code = str(r['DeptCode']).strip()
+
+        c.execute('''
+            INSERT INTO student_profiles (emp_id, name, dept_code, status)
+            VALUES (?, ?, ?, 'Active')
+            ON CONFLICT(emp_id) DO UPDATE SET
+                name = excluded.name,
+                dept_code = excluded.dept_code
+        ''', (norm_id, name, dept_code))
+
         c.execute('''
             INSERT INTO attendance_logs
             (emp_id, name, record_date, shift_name, parent_dept, sub_dept, year, section, dept_code, clock_in, is_present, is_leave, is_absent, is_late, excuse_reason)
@@ -304,9 +338,9 @@ def save_records_to_db(df):
                 is_absent = CASE WHEN attendance_logs.is_leave = 1 THEN 0 ELSE excluded.is_absent END,
                 is_late = excluded.is_late
         ''', (
-            norm_id, str(r['Name']).strip(), str(r['Date']).strip(), str(r['ShiftName']).strip(),
+            norm_id, name, str(r['Date']).strip(), str(r['ShiftName']).strip(),
             str(r['ParentDept']).strip(), str(r['SubDept']).strip(), str(r['Year']).strip(), str(r['Section']).strip(),
-            str(r['DeptCode']).strip(), str(r['ClockIn']).strip(), int(r['IsPresent']),
+            dept_code, str(r['ClockIn']).strip(), int(r['IsPresent']),
             int(r['IsAbsent']), int(r['IsLate'])
         ))
     conn.commit()
@@ -335,6 +369,15 @@ def manual_attendance_override(emp_id, date_str, shift_name, new_status, clock_i
     is_lea = 1 if new_status == 'Leave' else 0
     is_lat = 1 if new_status == 'Late' else 0
     
+    if "Second Shift" in shift_name and "Friday" not in shift_name:
+        c.execute('''
+            SELECT shift_name FROM attendance_logs 
+            WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND shift_name LIKE '%Second Shift%Friday%'
+        ''', (norm_id, str(date_str).strip()))
+        match = c.fetchone()
+        if match:
+            shift_name = match[0]
+
     c.execute('''
         UPDATE attendance_logs
         SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
@@ -479,8 +522,15 @@ def parse_biotime_excel(uploaded_file):
 
     return pd.DataFrame(processed_records), full_shift_title, late_threshold
 
-def apply_leave_mapping(df, leave_mapping):
+def apply_leave_and_status_filtering(df, leave_mapping):
     df = df.copy()
+    
+    profiles = load_student_profiles()
+    if not profiles.empty:
+        withdrawn_ids = set(profiles[profiles['status'] == 'Withdrawn']['emp_id'].tolist())
+        if withdrawn_ids:
+            df = df[~df['emp_id'].isin(withdrawn_ids)]
+
     df['IsLeave'] = 0
     df['IsAbsent'] = 1 - df['IsPresent']
     
@@ -494,7 +544,7 @@ def apply_leave_mapping(df, leave_mapping):
     return df
 
 def build_html_report(df, leave_mapping, shift_title, report_date):
-    df = apply_leave_mapping(df, leave_mapping)
+    df = apply_leave_and_status_filtering(df, leave_mapping)
 
     html = f"""
     <html>
@@ -996,7 +1046,6 @@ def generate_interactive_master_workbook(df, output_path):
                 for col in ['A', 'B', 'C', 'D', 'E', 'F']:
                     ws_det.column_dimensions[col].width = 22
 
-                # Absent Sub-sheet
                 abs_group = sec_group[(sec_group['IsPresent'] == 0) & (sec_group['IsLeave'] == 0)]
                 ws_abs = wb.create_sheet(title=abs_sheet_name)
                 ws_abs.views.sheetView[0].showGridLines = True
@@ -1044,7 +1093,6 @@ def generate_interactive_master_workbook(df, output_path):
                 for col in ['A', 'B', 'C', 'D', 'E', 'F']:
                     ws_abs.column_dimensions[col].width = 22
 
-                # Late Sub-sheet
                 late_group = sec_group[sec_group['IsLate'] == 1]
                 ws_late = wb.create_sheet(title=late_sheet_name)
                 ws_late.views.sheetView[0].showGridLines = True
@@ -1098,7 +1146,7 @@ def generate_interactive_master_workbook(df, output_path):
     wb.save(output_path)
 
 def generate_excel_report(df, leave_mapping, output_path):
-    df = apply_leave_mapping(df, leave_mapping)
+    df = apply_leave_and_status_filtering(df, leave_mapping)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1216,7 +1264,7 @@ def generate_excel_report(df, leave_mapping, output_path):
     wb.save(output_path)
 
 def generate_all_reports_suite(df, leave_mapping):
-    df_report_preview = apply_leave_mapping(df, leave_mapping)
+    df_filtered = apply_leave_and_status_filtering(df, leave_mapping)
     
     run_timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     shift_tag = df['ShiftName'].iloc[0].replace(' ', '_').replace('(', '').replace(')', '')
@@ -1224,7 +1272,7 @@ def generate_all_reports_suite(df, leave_mapping):
     os.makedirs(output_dir, exist_ok=True)
 
     save_records_to_db(df)
-    generate_interactive_master_workbook(df_report_preview, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
+    generate_interactive_master_workbook(df_filtered, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
     generate_excel_report(df, leave_mapping, os.path.join(output_dir, "Daily_Attendance_Executive_Summary.xlsx"))
 
     return os.path.abspath(output_dir)
@@ -1369,7 +1417,6 @@ def generate_fine_excel(report_data, section_code, date_range_str):
     wb.save(output)
     return output.getvalue()
 
-# --- EXECUTIVE COMMAND HUB HEADER ---
 st.markdown(f"""
 <div style="background: linear-gradient(135deg, #1E293B, #0F172A); padding: 25px 30px; border-radius: 16px; border: 1px solid #334155; margin-bottom: 25px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);">
     <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -1390,14 +1437,14 @@ if user_role == 'Admin':
     tab1, tab_archive_admin, tab2, tab3, tab4 = st.tabs([
         "🚀 Process Daily Log", 
         "📋 Daily Records Archive", 
-        "🚨 Warnings, Overrides & Leave Portal", 
+        "🚨 Warnings, Overrides & Lifecycles", 
         "🔍 Student Profile Search", 
         "💰 Monthly Fine Settlement"
     ])
 else:
     tab_archive, tab2, tab3, tab4 = st.tabs([
         "📋 Daily Records Archive",
-        "🚨 Warning & Exemption View", 
+        "🚨 Warning & Status View", 
         "🔍 Student Profile Search",
         "💰 Monthly Fine Summary (View-Only)"
     ])
@@ -1505,7 +1552,7 @@ if user_role == 'Admin':
             except Exception as e:
                 st.error(f"Error processing file: {e}")
 
-# --- TAB ARCHIVE: ADMIN & VIEWER DAILY RECORDS ARCHIVE ---
+# --- TAB ARCHIVE: DAILY RECORDS ARCHIVE ---
 target_archive_tab = tab_archive_admin if user_role == 'Admin' else tab_archive
 
 with target_archive_tab:
@@ -1564,14 +1611,15 @@ with target_archive_tab:
             st.markdown("#### Detailed Attendance Logs")
             st.dataframe(filtered_logs[['record_date', 'shift_name', 'emp_id', 'name', 'parent_dept', 'sub_dept', 'dept_code', 'clock_in', 'is_present', 'is_absent', 'is_leave', 'is_late', 'excuse_reason']], use_container_width=True)
 
-# --- TAB 2: WARNINGS & MANUAL OVERRIDES / LEAVE PORTAL ---
+# --- TAB 2: WARNINGS, OVERRIDES & STUDENT LIFECYCLE PORTAL ---
 with tab2:
     if user_role == 'Admin':
-        st.markdown("### 🚨 Disciplinary Warning & Manual Attendance Override Portal")
+        st.markdown("### 🚨 Warnings, Overrides & Student Lifecycle Management")
     else:
-        st.markdown("### 🚨 Disciplinary Warning & Exemption View (Read-Only)")
+        st.markdown("### 🚨 Disciplinary Warning & Student Status View (Read-Only)")
 
     df_db = load_all_attendance_logs()
+    profiles_df = load_student_profiles()
 
     if df_db.empty:
         st.info("No attendance records in history database yet.")
@@ -1583,48 +1631,70 @@ with tab2:
             Total_Leave=('is_leave', 'sum')
         ).reset_index()
 
+        if not profiles_df.empty:
+            abs_summary = abs_summary.merge(profiles_df[['emp_id', 'status', 'withdrawal_date', 'reinstated_date']], on='emp_id', how='left')
+            abs_summary['status'] = abs_summary['status'].fillna('Active')
+        else:
+            abs_summary['status'] = 'Active'
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Total Logged Days", df_db['record_date'].nunique())
-        c2.metric("1st Warning (4+ Abs)", len(abs_summary[abs_summary['Total_Absent'] >= 4]))
-        c3.metric("2nd Warning (8+ Abs)", len(abs_summary[abs_summary['Total_Absent'] >= 8]))
-        c4.metric("Withdrawal Notice (12+ Abs)", len(abs_summary[abs_summary['Total_Absent'] >= 12]))
+        c2.metric("1st Warning (4+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['status'] == 'Active')]))
+        c3.metric("2nd Warning (8+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 8) & (abs_summary['status'] == 'Active')]))
+        c4.metric("Total Withdrawn", len(abs_summary[abs_summary['status'] == 'Withdrawn']))
 
         st.markdown("---")
-        st.markdown("#### 🚩 Personnel Requiring Action")
+        st.markdown("#### 🚩 Personnel Status & Roster")
 
-        warning_filter = st.radio("Filter Stage:", ["All Warnings", "1st Warning (4-7 Absences)", "2nd Warning (8-11 Absences)", "Withdrawal Notice (12+ Absences)"], key="warning_radio_viewer" if user_role == 'Viewer' else "warning_radio_admin")
+        warning_filter = st.radio("Filter Stage:", ["All Active Personnel", "Withdrawn Students", "1st Warning (4-7 Abs)", "2nd Warning (8-11 Abs)", "Withdrawal Notice (12+ Abs)"], key="warning_radio_view" if user_role == 'Viewer' else "warning_radio_adm")
         
-        if warning_filter == "1st Warning (4-7 Absences)":
-            flagged = abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['Total_Absent'] < 8)]
-        elif warning_filter == "2nd Warning (8-11 Absences)":
-            flagged = abs_summary[(abs_summary['Total_Absent'] >= 8) & (abs_summary['Total_Absent'] < 12)]
-        elif warning_filter == "Withdrawal Notice (12+ Absences)":
-            flagged = abs_summary[abs_summary['Total_Absent'] >= 12]
+        if warning_filter == "Withdrawn Students":
+            flagged = abs_summary[abs_summary['status'] == 'Withdrawn']
+        elif warning_filter == "1st Warning (4-7 Abs)":
+            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 4) & (abs_summary['Total_Absent'] < 8)]
+        elif warning_filter == "2nd Warning (8-11 Abs)":
+            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 8) & (abs_summary['Total_Absent'] < 12)]
+        elif warning_filter == "Withdrawal Notice (12+ Abs)":
+            flagged = abs_summary[(abs_summary['status'] == 'Active') & (abs_summary['Total_Absent'] >= 12)]
         else:
-            flagged = abs_summary[abs_summary['Total_Absent'] >= 4]
+            flagged = abs_summary[abs_summary['status'] == 'Active']
 
         sorted_flagged = flagged.sort_values(by='Total_Absent', ascending=False)
         st.dataframe(sorted_flagged, use_container_width=True)
 
-        if not sorted_flagged.empty:
-            export_filename = f"Disciplinary_Warning_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                sorted_flagged.to_excel(writer, sheet_name='Warning_List', index=False)
-            processed_data = output.getvalue()
-
-            st.download_button(
-                label="📥 Export Filtered Warning List to Excel",
-                data=processed_data,
-                file_name=export_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
         if user_role == 'Admin':
             st.markdown("---")
+            st.markdown("### 🎓 Student Lifecycle Manager (Active / Withdrawn)")
+            st.caption("Select a student to toggle their status between Active and Withdrawn. Withdrawn students are frozen from attendance counts and fine bills.")
+
+            all_stud_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Status: {r['status']}]" for _, r in abs_summary.iterrows()]
+            selected_lifecycle_str = st.selectbox("Select Student for Lifecycle Update:", all_stud_options, key="lifecycle_student_select")
+
+            if selected_lifecycle_str:
+                sel_life_id = normalize_emp_id(selected_lifecycle_str.split(" - ")[0])
+                current_st_row = abs_summary[abs_summary['emp_id'] == sel_life_id].iloc[0]
+                current_status = current_st_row['status']
+
+                col_lc1, col_lc2 = st.columns(2)
+                with col_lc1:
+                    st.write(f"**Current Status:** `{current_status}`")
+                    if current_status == 'Withdrawn':
+                        st.write(f"**Withdrawn On:** `{current_st_row.get('withdrawal_date', 'N/A')}`")
+                    else:
+                        st.write(f"**Reinstated/Active Since:** `{current_st_row.get('reinstated_date', 'Registry Date')}`")
+
+                with col_lc2:
+                    new_target_status = st.selectbox("Change Status To:", ["Active", "Withdrawn"], index=0 if current_status == 'Active' else 1, key="new_status_target")
+                    status_date = st.date_input("Effective Date", value=date.today(), key="status_eff_date")
+
+                if st.button("🔄 Update Student Lifecycle Status", type="primary", use_container_width=True):
+                    update_student_status(sel_life_id, new_target_status, status_date.strftime('%Y-%m-%d'))
+                    st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}**!")
+                    st.rerun()
+
+            st.markdown("---")
             st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
-            st.caption("Use this section to record direct leaves (e.g. reported by Class Rep) or mark presence for power outages.")
+            st.caption("Use this section to correct individual student log entries or record direct leaves.")
 
             all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
             student_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_students.iterrows()]
@@ -1659,58 +1729,73 @@ with tab2:
                         st.rerun()
 
             st.markdown("---")
-            st.markdown("### 🏥 Batch Convert Absence to Approved/Medical Leave")
-            st.caption("Select a flagged student to view their absent dates and convert medical proofs into excused leaves.")
+            st.markdown("### ⚡ Bulk Section Attendance Override (Power Outage Mode)")
+            with st.form("bulk_override_form"):
+                c_b1, c_b2, c_b3 = st.columns(3)
+                with c_b1:
+                    bulk_date = st.date_input("Target Date", value=date.today(), key="bulk_date_input")
+                with c_b2:
+                    all_shifts_bulk = sorted(df_db['shift_name'].unique().tolist()) if not df_db.empty else ['First Shift']
+                    bulk_shift = st.selectbox("Target Shift", all_shifts_bulk, key="bulk_shift_input")
+                with c_b3:
+                    all_secs_bulk = sorted(df_db['dept_code'].unique().tolist()) if not df_db.empty else []
+                    bulk_section = st.selectbox("Target Section", all_secs_bulk, key="bulk_section_input")
 
-            flagged_emp_list = sorted_flagged['emp_id'].tolist() if not sorted_flagged.empty else sorted(df_db[df_db['is_absent'] == 1]['emp_id'].unique().tolist())
-            
-            if flagged_emp_list:
-                selected_exemption_emp = st.selectbox("Select Student / Employee ID for Exemption:", flagged_emp_list, key="exempt_select")
+                col_bo1, col_bo2 = st.columns(2)
+                with col_bo1:
+                    bulk_status = st.selectbox("New Status for Section", ["Present", "Late", "Leave", "Absent"], key="bulk_status_input")
+                with col_bo2:
+                    bulk_time = st.text_input("Default Clock-In Time (HH:MM)", value="08:00", key="bulk_time_input")
 
-                if selected_exemption_emp:
-                    norm_exempt_id = normalize_emp_id(selected_exemption_emp)
-                    emp_absent_records = df_db[(df_db['emp_id'] == norm_exempt_id) & (df_db['is_absent'] == 1)].sort_values(by='record_date')
-                    emp_info = df_db[df_db['emp_id'] == norm_exempt_id].iloc[0]
+                bulk_reason = st.text_input("Reason / Note", value="Power Outage - Bulk Manual Verification")
 
-                    st.write(f"**Student Name:** {emp_info['name']} | **Dept:** {emp_info['dept_code']}")
+                submit_bulk = st.form_submit_button("🚀 Apply Bulk Override to Entire Section", type="primary", use_container_width=True)
 
-                    if emp_absent_records.empty:
-                        st.success("This student has no recorded unexcused absences!")
+                if submit_bulk:
+                    target_d_str = bulk_date.strftime('%Y-%m-%d')
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    
+                    is_pres = 1 if bulk_status in ['Present', 'Late'] else 0
+                    is_abs = 1 if bulk_status == 'Absent' else 0
+                    is_lea = 1 if bulk_status == 'Leave' else 0
+                    is_lat = 1 if bulk_status == 'Late' else 0
+                    
+                    c.execute('''
+                        UPDATE attendance_logs
+                        SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
+                        WHERE TRIM(dept_code) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
+                    ''', (is_pres, is_abs, is_lea, is_lat, str(bulk_time).strip(), str(bulk_reason).strip(), str(bulk_section).strip(), target_d_str, str(bulk_shift).strip()))
+                    
+                    affected_rows = c.rowcount
+                    conn.commit()
+                    conn.close()
+                    
+                    if affected_rows > 0:
+                        st.success(f"Successfully updated **{affected_rows} students** in section `{bulk_section}` for {target_d_str} ({bulk_shift}) to `{bulk_status}`!")
+                        st.rerun()
                     else:
-                        absent_dates_with_shifts = emp_absent_records[['record_date', 'shift_name']].drop_duplicates()
-                        date_shift_options = [f"{row['record_date']} ({row['shift_name']})" for _, row in absent_dates_with_shifts.iterrows()]
-                        
-                        selected_options = st.multiselect("Select Date & Shift to Excuse / Convert to Leave:", date_shift_options)
-                        reason_input = st.text_input("Approval Reason / Medical Certificate Details:", value="Medical Certificate Provided")
-
-                        if st.button("✅ Convert Selected Dates to Excused Leave", type="primary"):
-                            if not selected_options:
-                                st.warning("Please select at least one date/shift to convert.")
-                            else:
-                                for opt in selected_options:
-                                    d_str = opt.split(" (")[0].strip()
-                                    s_name = opt.split(" (")[1].rstrip(")").strip()
-                                    convert_absence_to_leave(norm_exempt_id, [d_str], s_name, reason_input)
-                                st.success(f"Successfully converted selected record(s) to Approved Leave!")
-                                st.rerun()
-            else:
-                st.info("No students currently have unexcused absences.")
+                        st.warning(f"⚠️ No matching records found for section `{bulk_section}` on `{target_d_str}` under shift `{bulk_shift}`.")
 
 # --- TAB 3: STUDENT PROFILE SEARCH ---
 with tab3:
     st.markdown("### 🔍 Individual Student Attendance Performance Profile")
     
     df_db = load_all_attendance_logs()
+    profiles_df = load_student_profiles()
 
     if not df_db.empty:
         emp_list = sorted(df_db['emp_id'].unique().tolist())
-        
         selected_emp = st.selectbox("Select Employee / Student ID:", emp_list, key="search_emp_select")
 
         if selected_emp:
             norm_sel_emp = normalize_emp_id(selected_emp)
             emp_records = df_db[df_db['emp_id'] == norm_sel_emp].sort_values(by=['record_date', 'shift_name'])
             
+            p_row = profiles_df[profiles_df['emp_id'] == norm_sel_emp]
+            status_val = p_row['status'].iloc[0] if not p_row.empty else 'Active'
+            w_date = p_row['withdrawal_date'].iloc[0] if not p_row.empty else 'N/A'
+
             if not emp_records.empty:
                 emp_name = emp_records['name'].iloc[0]
                 emp_dept = emp_records['dept_code'].iloc[0]
@@ -1723,7 +1808,14 @@ with tab3:
 
                 pct = (tot_pres / max(tot_days, 1)) * 100
 
-                st.subheader(f"Profile: {emp_name} ({norm_sel_emp}) - {emp_dept}")
+                col_pr1, col_pr2 = st.columns([3, 1])
+                with col_pr1:
+                    st.subheader(f"Profile: {emp_name} ({norm_sel_emp}) - {emp_dept}")
+                with col_pr2:
+                    if status_val == 'Withdrawn':
+                        st.error(f"🔴 **STATUS: WITHDRAWN** (Since: {w_date})")
+                    else:
+                        st.success("🟢 **STATUS: ACTIVE**")
                 
                 p1, p2, p3, p4, p5 = st.columns(5)
                 p1.metric("Attendance %", f"{pct:.1f}%")
@@ -1743,9 +1835,10 @@ with tab3:
 with tab4:
     st.markdown("### 💰 Monthly Fine Settlement & Disciplinary Billing Engine")
     if user_role == 'Viewer':
-        st.info("👀 **Viewer Mode:** You are viewing calculated fine summaries in read-only mode. Edits and recalculations are restricted to Admin.")
+        st.info("👀 **Viewer Mode:** You are viewing calculated fine summaries in read-only mode. Withdrawn students are automatically excluded from fines.")
 
     df_db = load_all_attendance_logs()
+    profiles_df = load_student_profiles()
 
     if df_db.empty:
         st.info("No logs in database. Process daily attendance logs first!")
@@ -1787,6 +1880,10 @@ with tab4:
             (df_db['record_date'] <= end_str)
         ]
 
+        withdrawn_set = set()
+        if not profiles_df.empty:
+            withdrawn_set = set(profiles_df[profiles_df['status'] == 'Withdrawn']['emp_id'].tolist())
+
         warning_map = {}
         for emp_id, emp_grp in df_db.groupby('emp_id'):
             tot_abs = emp_grp['is_absent'].sum()
@@ -1800,11 +1897,12 @@ with tab4:
                 warning_map[emp_id] = "Normal"
 
         unique_students = sec_logs[['emp_id', 'name']].drop_duplicates().sort_values(by='emp_id')
+        active_unique_students = unique_students[~unique_students['emp_id'].isin(withdrawn_set)]
 
-        if unique_students.empty:
-            st.warning(f"No attendance logs found for section **{selected_section}** between {start_str} and {end_str}.")
+        if active_unique_students.empty:
+            st.warning(f"No active attendance logs found for section **{selected_section}** between {start_str} and {end_str} (Withdrawn students excluded).")
         else:
-            st.markdown(f"#### 📋 Fine Settlement Roster — Section `{selected_section}`")
+            st.markdown(f"#### 📋 Fine Settlement Roster — Section `{selected_section}` (Active Students Only)")
 
             if user_role == 'Admin':
                 st.info("💡 Enter your adjustments below, then click **Calculate & Refresh Totals** to update all amounts instantly.")
@@ -1817,7 +1915,7 @@ with tab4:
 
                     form_inputs = []
 
-                    for idx, (_, st_row) in enumerate(unique_students.iterrows()):
+                    for idx, (_, st_row) in enumerate(active_unique_students.iterrows()):
                         e_id = normalize_emp_id(st_row['emp_id'])
                         e_name = str(st_row['name']).strip()
                         
@@ -2017,39 +2115,3 @@ with tab4:
                         "\">🖨️ Print Section Fine Sheet (A4 Portrait)</button>"
                     )
                     st.components.v1.html(print_fine_script, height=60)
-
-            else:
-                viewer_report_items = []
-                tot_abs_sum = 0
-                tot_late_sum = 0
-                tot_auto_fine_sum = 0
-
-                for _, st_row in unique_students.iterrows():
-                    e_id = normalize_emp_id(st_row['emp_id'])
-                    e_name = str(st_row['name']).strip()
-                    emp_period_df = sec_logs[sec_logs['emp_id'] == e_id]
-                    
-                    abs_cnt, late_cnt, absent_fine, late_fine = calculate_student_fine_breakdown(emp_period_df, is_inliving=False)
-                    auto_fine = absent_fine + late_fine
-                    warn_status = warning_map.get(e_id, "Normal")
-
-                    tot_abs_sum += abs_cnt
-                    tot_late_sum += late_cnt
-                    tot_auto_fine_sum += auto_fine
-
-                    viewer_report_items.append({
-                        'Student ID': e_id,
-                        'Student Name': e_name,
-                        'Abs': abs_cnt,
-                        'Late': late_cnt,
-                        'Auto Fine (Rs.)': auto_fine,
-                        'Warnings': warn_status
-                    })
-
-                df_viewer_display = pd.DataFrame(viewer_report_items)
-                st.dataframe(df_viewer_display, use_container_width=True)
-
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Total Absences", tot_abs_sum)
-                m2.metric("Total Lates", tot_late_sum)
-                m3.metric("Total Auto Fines", f"Rs. {tot_auto_fine_sum:,}")
