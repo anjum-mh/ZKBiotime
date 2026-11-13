@@ -475,7 +475,7 @@ def detect_shift_and_threshold(df_records):
         if avg_hour >= 11:
             shift_name = 'Second Shift'
 
-    late_threshold = ('14:05' if is_friday else '12:55') if shift_name == 'Second Shift' else '08:05'
+    late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:10'
     return shift_name, late_threshold, is_friday
 
 def parse_biotime_excel(uploaded_file):
@@ -686,6 +686,623 @@ def build_html_report(df, leave_mapping, shift_title, report_date):
     html += "</tbody></table></body></html>"
     return html
 
+def generate_interactive_master_workbook(df, output_path):
+    wb = openpyxl.Workbook()
+    default_sheet = wb.active
+
+    primary_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    font_title = Font(name="Calibri", size=14, bold=True, color="1E293B")
+    font_hdr = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    font_reg = Font(name="Calibri", size=11)
+    font_grand = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+    
+    btn_blue_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
+    btn_blue_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    btn_blue_border = Border(left=Side(style='medium', color='1E40AF'), right=Side(style='medium', color='1E40AF'), top=Side(style='medium', color='1E40AF'), bottom=Side(style='medium', color='1E40AF'))
+
+    btn_dark_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    btn_dark_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    btn_dark_border = Border(left=Side(style='medium', color='0F172A'), right=Side(style='medium', color='0F172A'), top=Side(style='medium', color='0F172A'), bottom=Side(style='medium', color='0F172A'))
+
+    btn_amber_fill = PatternFill(start_color="D97706", end_color="D97706", fill_type="solid")
+    btn_amber_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    btn_amber_border = Border(left=Side(style='medium', color='B45309'), right=Side(style='medium', color='B45309'), top=Side(style='medium', color='B45309'), bottom=Side(style='medium', color='B45309'))
+
+    thin_side = Side(border_style="thin", color="CBD5E1")
+    double_bottom = Side(border_style="double", color="1E293B")
+    border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    border_grand = Border(left=thin_side, right=thin_side, top=thin_side, bottom=double_bottom)
+
+    used_sheet_names = set()
+
+    def make_unique_sheet_name(raw_name, prefix=""):
+        clean_name = raw_name.strip().replace(' ', '_').replace('/', '_').replace('-', '_')
+        candidate = f"{prefix}{clean_name}"[:28]
+        final_name = candidate
+        counter = 1
+        while final_name.lower() in [s.lower() for s in used_sheet_names]:
+            final_name = f"{candidate[:24]}_{counter}"
+            counter += 1
+        used_sheet_names.add(final_name)
+        return final_name
+
+    parent_sheets = {}
+    sub_dept_sheets = {}
+    section_sheets = {}
+    absent_sheets = {}
+    late_sheets = {}
+
+    for parent in PARENT_ORDER:
+        p_data = df[df['ParentDept'] == parent]
+        if p_data.empty:
+            continue
+        parent_sheets[parent] = make_unique_sheet_name(parent[:15], "Sub_")
+
+        for sub_dept, sub_group in p_data.groupby('SubDept'):
+            sub_dept_sheets[sub_dept] = make_unique_sheet_name(sub_dept[:15], "Sec_")
+
+            for dept_code, sec_group in sub_group.groupby('DeptCode'):
+                section_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "D_")
+                absent_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "Abs_")
+                late_sheets[dept_code] = make_unique_sheet_name(dept_code[:15], "Late_")
+
+    ws_master = wb.create_sheet(title="Master Summary")
+    ws_master.views.sheetView[0].showGridLines = True
+    ws_master.merge_cells("A1:G1")
+    ws_master["A1"] = "HIERARCHICAL ATTENDANCE SUMMARY (MASTER)"
+    ws_master["A1"].font = font_title
+    ws_master["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_master.row_dimensions[1].height = 25
+
+    headers = ["Parent Department", "Total Strength", "Total Present", "Total Absent", "Total Leave", "Total Late", "Action Button"]
+    for c_idx, h in enumerate(headers, 1):
+        cell = ws_master.cell(row=2, column=c_idx, value=h)
+        cell.font = font_hdr
+        cell.fill = primary_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border_cell
+    ws_master.row_dimensions[2].height = 22
+
+    r_idx = 3
+    master_start_row = 3
+    for parent in PARENT_ORDER:
+        p_data = df[df['ParentDept'] == parent]
+        if p_data.empty:
+            continue
+        tot = len(p_data)
+        pres = int(p_data['IsPresent'].sum())
+        leave = int(p_data['IsLeave'].sum())
+        absent = max(0, tot - pres - leave)
+        late = int(p_data['IsLate'].sum())
+
+        sub_sheet_name = parent_sheets[parent]
+        
+        ws_master.cell(row=r_idx, column=1, value=parent).font = font_reg
+        ws_master.cell(row=r_idx, column=2, value=tot).font = font_reg
+        ws_master.cell(row=r_idx, column=3, value=pres).font = font_reg
+        ws_master.cell(row=r_idx, column=4, value=absent).font = font_reg
+        ws_master.cell(row=r_idx, column=5, value=leave).font = font_reg
+        ws_master.cell(row=r_idx, column=6, value=late).font = font_reg
+        
+        action_cell = ws_master.cell(row=r_idx, column=7, value=" VIEW CHILD DEPTS ")
+        action_cell.font = btn_blue_font
+        action_cell.fill = btn_blue_fill
+        action_cell.border = btn_blue_border
+        action_cell.alignment = Alignment(horizontal="center", vertical="center")
+        action_cell.hyperlink = f"#'{sub_sheet_name}'!A1"
+
+        for c in range(1, 7):
+            c_cell = ws_master.cell(row=r_idx, column=c)
+            c_cell.border = border_cell
+            if c > 1:
+                c_cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                c_cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws_master.row_dimensions[r_idx].height = 24
+        r_idx += 1
+
+    master_end_row = r_idx - 1
+
+    ws_master.cell(row=r_idx, column=1, value="GRAND TOTAL").font = font_grand
+    ws_master.cell(row=r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
+        cell = ws_master.cell(row=r_idx, column=c_idx, value=f"=SUM({col_letter}{master_start_row}:{col_letter}{master_end_row})")
+        cell.font = font_grand
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws_master.cell(row=r_idx, column=7, value="").fill = primary_fill
+
+    for c in range(1, 8):
+        c_cell = ws_master.cell(row=r_idx, column=c)
+        c_cell.border = border_grand
+        if c < 7:
+            c_cell.fill = primary_fill
+    ws_master.row_dimensions[r_idx].height = 25
+
+    ws_master.column_dimensions['A'].width = 45
+    for col in ['B', 'C', 'D', 'E', 'F']:
+        ws_master.column_dimensions[col].width = 18
+    ws_master.column_dimensions['G'].width = 26
+
+    for parent in PARENT_ORDER:
+        p_data = df[df['ParentDept'] == parent]
+        if p_data.empty:
+            continue
+        sub_sheet_name = parent_sheets[parent]
+        ws_sub = wb.create_sheet(title=sub_sheet_name)
+        ws_sub.views.sheetView[0].showGridLines = True
+
+        ws_sub.merge_cells("A1:G1")
+        ws_sub["A1"] = f"{parent.upper()} - SUB DEPARTMENTS"
+        ws_sub["A1"].font = font_title
+        ws_sub["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws_sub.row_dimensions[1].height = 25
+
+        back_cell = ws_sub.cell(row=2, column=1, value=" ◀ BACK TO MASTER ")
+        back_cell.font = btn_dark_font
+        back_cell.fill = btn_dark_fill
+        back_cell.border = btn_dark_border
+        back_cell.alignment = Alignment(horizontal="center", vertical="center")
+        back_cell.hyperlink = "#'Master Summary'!A1"
+
+        sub_headers = ["Child / Sub-Department", "Total Strength", "Total Present", "Total Absent", "Total Leave", "Total Late", "Action Button"]
+        for c_idx, h in enumerate(sub_headers, 1):
+            cell = ws_sub.cell(row=3, column=c_idx, value=h)
+            cell.font = font_hdr
+            cell.fill = primary_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border_cell
+        ws_sub.row_dimensions[3].height = 22
+
+        sub_start_row = 4
+        sub_r_idx = sub_start_row
+        for sub_dept, sub_group in p_data.groupby('SubDept'):
+            stot = len(sub_group)
+            spres = int(sub_group['IsPresent'].sum())
+            sleave = int(sub_group['IsLeave'].sum())
+            sabsent = max(0, stot - spres - sleave)
+            slate = int(sub_group['IsLate'].sum())
+
+            sec_sheet_name = sub_dept_sheets[sub_dept]
+
+            ws_sub.cell(row=sub_r_idx, column=1, value=sub_dept).font = font_reg
+            ws_sub.cell(row=sub_r_idx, column=2, value=stot).font = font_reg
+            ws_sub.cell(row=sub_r_idx, column=3, value=spres).font = font_reg
+            ws_sub.cell(row=sub_r_idx, column=4, value=sabsent).font = font_reg
+            ws_sub.cell(row=sub_r_idx, column=5, value=sleave).font = font_reg
+            ws_sub.cell(row=sub_r_idx, column=6, value=slate).font = font_reg
+
+            act_cell = ws_sub.cell(row=sub_r_idx, column=7, value=" VIEW SECTIONS ")
+            act_cell.font = btn_blue_font
+            act_cell.fill = btn_blue_fill
+            act_cell.border = btn_blue_border
+            act_cell.alignment = Alignment(horizontal="center", vertical="center")
+            act_cell.hyperlink = f"#'{sec_sheet_name}'!A1"
+
+            for c in range(1, 7):
+                c_cell = ws_sub.cell(row=sub_r_idx, column=c)
+                c_cell.border = border_cell
+                if c > 1:
+                    c_cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    c_cell.alignment = Alignment(horizontal="left", vertical="center")
+            ws_sub.row_dimensions[sub_r_idx].height = 24
+            sub_r_idx += 1
+
+        sub_end_row = sub_r_idx - 1
+
+        ws_sub.cell(row=sub_r_idx, column=1, value="TOTAL").font = font_grand
+        ws_sub.cell(row=sub_r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
+        for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
+            cell = ws_sub.cell(row=sub_r_idx, column=c_idx, value=f"=SUM({col_letter}{sub_start_row}:{col_letter}{sub_end_row})")
+            cell.font = font_grand
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws_sub.cell(row=sub_r_idx, column=7, value="").fill = primary_fill
+
+        for c in range(1, 8):
+            c_cell = ws_sub.cell(row=sub_r_idx, column=c)
+            c_cell.border = border_grand
+            if c < 7:
+                c_cell.fill = primary_fill
+        ws_sub.row_dimensions[sub_r_idx].height = 25
+
+        ws_sub.column_dimensions['A'].width = 40
+        for col in ['B', 'C', 'D', 'E', 'F']:
+            ws_sub.column_dimensions[col].width = 18
+        ws_sub.column_dimensions['G'].width = 24
+
+        for sub_dept, sub_group in p_data.groupby('SubDept'):
+            sec_sheet_name = sub_dept_sheets[sub_dept]
+            ws_sec = wb.create_sheet(title=sec_sheet_name)
+            ws_sec.views.sheetView[0].showGridLines = True
+            ws_sec.merge_cells("A1:G1")
+            ws_sec["A1"] = f"{sub_dept.upper()} - SECTIONS SUMMARY"
+            ws_sec["A1"].font = font_title
+            ws_sec["A1"].alignment = Alignment(horizontal="center", vertical="center")
+            ws_sec.row_dimensions[1].height = 25
+
+            b_cell = ws_sec.cell(row=2, column=1, value=" ◀ BACK TO SUB-DEPTS ")
+            b_cell.font = btn_dark_font
+            b_cell.fill = btn_dark_fill
+            b_cell.border = btn_dark_border
+            b_cell.alignment = Alignment(horizontal="center", vertical="center")
+            b_cell.hyperlink = f"#'{sub_sheet_name}'!A1"
+
+            sec_headers = ["Year & Section", "Total Strength", "Present", "Absent", "Leave", "Late", "Action Button"]
+            for c_idx, h in enumerate(sec_headers, 1):
+                cell = ws_sec.cell(row=3, column=c_idx, value=h)
+                cell.font = font_hdr
+                cell.fill = primary_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = border_cell
+            ws_sec.row_dimensions[3].height = 22
+
+            sec_start_row = 4
+            sec_r_idx = sec_start_row
+            for dept_code, sec_group in sub_group.groupby('DeptCode'):
+                dtot = len(sec_group)
+                dpres = int(sec_group['IsPresent'].sum())
+                dleave = int(sec_group['IsLeave'].sum())
+                dabsent = max(0, dtot - dpres - dleave)
+                dlate = int(sec_group['IsLate'].sum())
+
+                detail_sheet_name = section_sheets[dept_code]
+
+                ws_sec.cell(row=sec_r_idx, column=1, value=dept_code).font = font_reg
+                ws_sec.cell(row=sec_r_idx, column=2, value=dtot).font = font_reg
+                ws_sec.cell(row=sec_r_idx, column=3, value=dpres).font = font_reg
+                ws_sec.cell(row=sec_r_idx, column=4, value=dabsent).font = font_reg
+                ws_sec.cell(row=sec_r_idx, column=5, value=dleave).font = font_reg
+                ws_sec.cell(row=sec_r_idx, column=6, value=dlate).font = font_reg
+
+                d_act = ws_sec.cell(row=sec_r_idx, column=7, value=" VIEW DETAILS ")
+                d_act.font = btn_blue_font
+                d_act.fill = btn_blue_fill
+                d_act.border = btn_blue_border
+                d_act.alignment = Alignment(horizontal="center", vertical="center")
+                d_act.hyperlink = f"#'{detail_sheet_name}'!A1"
+
+                for c in range(1, 7):
+                    c_cell = ws_sec.cell(row=sec_r_idx, column=c)
+                    c_cell.border = border_cell
+                    if c > 1:
+                        c_cell.alignment = Alignment(horizontal="center", vertical="center")
+                    else:
+                        c_cell.alignment = Alignment(horizontal="left", vertical="center")
+                ws_sec.row_dimensions[sec_r_idx].height = 24
+                sec_r_idx += 1
+
+            sec_end_row = sec_r_idx - 1
+
+            ws_sec.cell(row=sec_r_idx, column=1, value="TOTAL").font = font_grand
+            ws_sec.cell(row=sec_r_idx, column=1).alignment = Alignment(horizontal="center", vertical="center")
+            for c_idx, col_letter in enumerate(['B', 'C', 'D', 'E', 'F'], 2):
+                cell = ws_sec.cell(row=sec_r_idx, column=c_idx, value=f"=SUM({col_letter}{sec_start_row}:{col_letter}{sec_end_row})")
+                cell.font = font_grand
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws_sec.cell(row=sec_r_idx, column=7, value="").fill = primary_fill
+
+            for c in range(1, 8):
+                c_cell = ws_sec.cell(row=sec_r_idx, column=c)
+                c_cell.border = border_grand
+                if c < 7:
+                    c_cell.fill = primary_fill
+            ws_sec.row_dimensions[sec_r_idx].height = 25
+
+            ws_sec.column_dimensions['A'].width = 30
+            for col in ['B', 'C', 'D', 'E', 'F']:
+                ws_sec.column_dimensions[col].width = 18
+            ws_sec.column_dimensions['G'].width = 22
+
+            for dept_code, sec_group in sub_group.groupby('DeptCode'):
+                detail_sheet_name = section_sheets[dept_code]
+                abs_sheet_name = absent_sheets[dept_code]
+                late_sheet_name = late_sheets[dept_code]
+
+                ws_det = wb.create_sheet(title=detail_sheet_name)
+                ws_det.views.sheetView[0].showGridLines = True
+                ws_det.merge_cells("A1:F1")
+                ws_det["A1"] = f"SECTION ROSTER: {sub_dept} ({dept_code})"
+                ws_det["A1"].font = font_title
+                ws_det["A1"].alignment = Alignment(horizontal="center", vertical="center")
+                ws_det.row_dimensions[1].height = 25
+
+                det_back = ws_det.cell(row=2, column=1, value=" ◀ BACK TO SECTIONS ")
+                det_back.font = btn_dark_font
+                det_back.fill = btn_dark_fill
+                det_back.border = btn_dark_border
+                det_back.alignment = Alignment(horizontal="center", vertical="center")
+                det_back.hyperlink = f"#'{sec_sheet_name}'!A1"
+
+                abs_link = ws_det.cell(row=2, column=3, value=" VIEW ABSENT STUDENTS ")
+                abs_link.font = btn_amber_font
+                abs_link.fill = btn_amber_fill
+                abs_link.border = btn_amber_border
+                abs_link.alignment = Alignment(horizontal="center", vertical="center")
+                abs_link.hyperlink = f"#'{abs_sheet_name}'!A1"
+
+                late_link = ws_det.cell(row=2, column=5, value=" VIEW LATE STUDENTS ")
+                late_link.font = btn_amber_font
+                late_link.fill = btn_amber_fill
+                late_link.border = btn_amber_border
+                late_link.alignment = Alignment(horizontal="center", vertical="center")
+                late_link.hyperlink = f"#'{late_sheet_name}'!A1"
+                ws_det.row_dimensions[2].height = 26
+
+                det_headers = ["Employee ID", "Employee Name", "Sub-Department", "Year & Section", "Clock-In Time", "Status"]
+                for c_idx, h in enumerate(det_headers, 1):
+                    cell = ws_det.cell(row=3, column=c_idx, value=h)
+                    cell.font = font_hdr
+                    cell.fill = primary_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = border_cell
+                ws_det.row_dimensions[3].height = 22
+
+                green_fill = PatternFill(start_color="D1E7DD", end_color="D1E7DD", fill_type="solid")
+                green_font = Font(name="Calibri", size=11, color="0F5132", bold=True)
+                amber_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+                amber_font = Font(name="Calibri", size=11, color="664D03", bold=True)
+                red_fill = PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid")
+                red_font = Font(name="Calibri", size=11, color="842029", bold=True)
+
+                d_r_idx = 4
+                for _, row in sec_group.iterrows():
+                    is_pres = row['IsPresent'] == 1
+                    is_leave = row['IsLeave'] == 1
+                    is_late = row['IsLate'] == 1
+
+                    if is_late:
+                        status_str = f"LATE ({row['ClockIn']})"
+                        s_fill, s_font = amber_fill, amber_font
+                    elif is_pres:
+                        status_str = f"PRESENT ({row['ClockIn']})"
+                        s_fill, s_font = green_fill, green_font
+                    elif is_leave:
+                        status_str = "LEAVE (Excused)"
+                        s_fill, s_font = amber_fill, amber_font
+                    else:
+                        status_str = "ABSENT (--:--)"
+                        s_fill, s_font = red_fill, red_font
+
+                    ws_det.cell(row=d_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
+                    ws_det.cell(row=d_r_idx, column=2, value=str(row['Name'])).font = font_reg
+                    ws_det.cell(row=d_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
+                    ws_det.cell(row=d_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
+                    ws_det.cell(row=d_r_idx, column=5, value=str(row['ClockIn']) if row['ClockIn'] else "--:--").font = font_reg
+                    
+                    status_cell = ws_det.cell(row=d_r_idx, column=6, value=status_str)
+                    status_cell.font = s_font
+                    status_cell.fill = s_fill
+
+                    for c in range(1, 7):
+                        c_cell = ws_det.cell(row=d_r_idx, column=c)
+                        c_cell.border = border_cell
+                        if c != 6:
+                            c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
+                        else:
+                            c_cell.alignment = Alignment(horizontal="center", vertical="center")
+                    ws_det.row_dimensions[d_r_idx].height = 20
+                    d_r_idx += 1
+
+                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
+                    ws_det.column_dimensions[col].width = 22
+
+                abs_group = sec_group[(sec_group['IsPresent'] == 0) & (sec_group['IsLeave'] == 0)]
+                ws_abs = wb.create_sheet(title=abs_sheet_name)
+                ws_abs.views.sheetView[0].showGridLines = True
+                ws_abs.merge_cells("A1:F1")
+                ws_abs["A1"] = f"ABSENT STUDENTS: {dept_code}"
+                ws_abs["A1"].font = font_title
+                ws_abs["A1"].alignment = Alignment(horizontal="center", vertical="center")
+                ws_abs.row_dimensions[1].height = 25
+
+                abs_back = ws_abs.cell(row=2, column=1, value=" ◀ BACK TO ROSTER ")
+                abs_back.font = btn_dark_font
+                abs_back.fill = btn_dark_fill
+                abs_back.border = btn_dark_border
+                abs_back.alignment = Alignment(horizontal="center", vertical="center")
+                abs_back.hyperlink = f"#'{detail_sheet_name}'!A1"
+                ws_abs.row_dimensions[2].height = 24
+
+                for c_idx, h in enumerate(det_headers, 1):
+                    cell = ws_abs.cell(row=3, column=c_idx, value=h)
+                    cell.font = font_hdr
+                    cell.fill = primary_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = border_cell
+                ws_abs.row_dimensions[3].height = 22
+
+                a_r_idx = 4
+                for _, row in abs_group.iterrows():
+                    ws_abs.cell(row=a_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
+                    ws_abs.cell(row=a_r_idx, column=2, value=str(row['Name'])).font = font_reg
+                    ws_abs.cell(row=a_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
+                    ws_abs.cell(row=a_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
+                    ws_abs.cell(row=a_r_idx, column=5, value="--:--").font = font_reg
+                    
+                    sc = ws_abs.cell(row=a_r_idx, column=6, value="ABSENT")
+                    sc.font = red_font
+                    sc.fill = red_fill
+
+                    for c in range(1, 7):
+                        c_cell = ws_abs.cell(row=a_r_idx, column=c)
+                        c_cell.border = border_cell
+                        c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
+                    ws_abs.row_dimensions[a_r_idx].height = 20
+                    a_r_idx += 1
+
+                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
+                    ws_abs.column_dimensions[col].width = 22
+
+                late_group = sec_group[sec_group['IsLate'] == 1]
+                ws_late = wb.create_sheet(title=late_sheet_name)
+                ws_late.views.sheetView[0].showGridLines = True
+                ws_late.merge_cells("A1:F1")
+                ws_late["A1"] = f"LATE STUDENTS: {dept_code}"
+                ws_late["A1"].font = font_title
+                ws_late["A1"].alignment = Alignment(horizontal="center", vertical="center")
+                ws_late.row_dimensions[1].height = 25
+
+                late_back = ws_late.cell(row=2, column=1, value=" ◀ BACK TO ROSTER ")
+                late_back.font = btn_dark_font
+                late_back.fill = btn_dark_fill
+                late_back.border = btn_dark_border
+                late_back.alignment = Alignment(horizontal="center", vertical="center")
+                late_back.hyperlink = f"#'{detail_sheet_name}'!A1"
+                ws_late.row_dimensions[2].height = 24
+
+                for c_idx, h in enumerate(det_headers, 1):
+                    cell = ws_late.cell(row=3, column=c_idx, value=h)
+                    cell.font = font_hdr
+                    cell.fill = primary_fill
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = border_cell
+                ws_late.row_dimensions[3].height = 22
+
+                l_r_idx = 4
+                for _, row in late_group.iterrows():
+                    ws_late.cell(row=l_r_idx, column=1, value=str(row['EmpID'])).font = font_reg
+                    ws_late.cell(row=l_r_idx, column=2, value=str(row['Name'])).font = font_reg
+                    ws_late.cell(row=l_r_idx, column=3, value=str(row['SubDept'])).font = font_reg
+                    ws_late.cell(row=l_r_idx, column=4, value=f"{row['Year']} - {row['Section']}").font = font_reg
+                    ws_late.cell(row=l_r_idx, column=5, value=str(row['ClockIn'])).font = font_reg
+                    
+                    sc = ws_late.cell(row=l_r_idx, column=6, value=f"LATE ({row['ClockIn']})")
+                    sc.font = amber_font
+                    sc.fill = amber_fill
+
+                    for c in range(1, 7):
+                        c_cell = ws_late.cell(row=l_r_idx, column=c)
+                        c_cell.border = border_cell
+                        c_cell.alignment = Alignment(horizontal="center" if c > 2 else "left", vertical="center")
+                    ws_late.row_dimensions[l_r_idx].height = 20
+                    l_r_idx += 1
+
+                for col in ['A', 'B', 'C', 'D', 'E', 'F']:
+                    ws_late.column_dimensions[col].width = 22
+
+    if default_sheet.title in wb.sheetnames and default_sheet != ws_master:
+        wb.remove(default_sheet)
+
+    wb.save(output_path)
+
+def generate_excel_report(df, leave_mapping, output_path):
+    df = apply_leave_and_status_filtering(df, leave_mapping)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Daily Attendance Report"
+    ws.views.sheetView[0].showGridLines = True
+
+    primary_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    subtotal_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    font_title = Font(name="Calibri", size=15, bold=True, color="1E293B")
+    font_dept_hdr = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    font_col_hdr = Font(name="Calibri", size=11, bold=True, color="1E293B")
+    font_bold = Font(name="Calibri", size=11, bold=True)
+    font_regular = Font(name="Calibri", size=11)
+    font_grand = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+
+    thin_side = Side(border_style="thin", color="CBD5E1")
+    double_bottom = Side(border_style="double", color="1E293B")
+    border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    border_grand = Border(left=thin_side, right=thin_side, top=thin_side, bottom=double_bottom)
+
+    report_date = df['Date'].iloc[0] if not df.empty else ''
+    full_shift_title = df['ShiftName'].iloc[0] if not df.empty else ''
+
+    ws.merge_cells("A1:F1")
+    ws["A1"] = f"Daily Attendance Report - {full_shift_title} - {report_date}"
+    ws["A1"].font = font_title
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    current_row = 3
+    subtotal_rows = []
+
+    for parent in PARENT_ORDER:
+        p_data = df[df['ParentDept'] == parent]
+        if p_data.empty:
+            continue
+
+        ws.merge_cells(start_row=current_row, start_column=1, end_row=current_row, end_column=6)
+        cell_p = ws.cell(row=current_row, column=1, value=parent)
+        cell_p.font = font_dept_hdr
+        cell_p.fill = primary_fill
+        cell_p.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[current_row].height = 22
+        current_row += 1
+
+        headers = ["", "Total Strength", "Present", "Absent", "Leave", "Late"]
+        for c_idx, h in enumerate(headers, 1):
+            cell = ws.cell(row=current_row, column=c_idx, value=h)
+            cell.font = font_col_hdr
+            cell.alignment = Alignment(horizontal="center" if c_idx > 1 else "left", vertical="center")
+            cell.border = border_cell
+        ws.row_dimensions[current_row].height = 20
+        current_row += 1
+
+        sec_start_row = current_row
+        for dept_code, sec_group in p_data.groupby('DeptCode'):
+            tot = len(sec_group)
+            pres = sec_group['IsPresent'].sum()
+            leave = sec_group['IsLeave'].sum()
+            absent = max(0, tot - pres - leave)
+            late = sec_group['IsLate'].sum()
+
+            ws.cell(row=current_row, column=1, value=dept_code).font = font_regular
+            ws.cell(row=current_row, column=2, value=tot).font = font_regular
+            ws.cell(row=current_row, column=3, value=pres).font = font_regular
+            ws.cell(row=current_row, column=4, value=absent).font = font_regular
+            ws.cell(row=current_row, column=5, value=leave).font = font_regular
+            ws.cell(row=current_row, column=6, value=late).font = font_regular
+
+            for c in range(1, 7):
+                c_cell = ws.cell(row=current_row, column=c)
+                c_cell.border = border_cell
+                if c > 1:
+                    c_cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws.row_dimensions[current_row].height = 20
+            current_row += 1
+
+        sec_end_row = current_row - 1
+        ws.cell(row=current_row, column=1, value="Subtotal").font = font_bold
+        ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="right", vertical="center")
+        ws.cell(row=current_row, column=2, value=f"=SUM(B{sec_start_row}:B{sec_end_row})").font = font_bold
+        ws.cell(row=current_row, column=3, value=f"=SUM(C{sec_start_row}:C{sec_end_row})").font = font_bold
+        ws.cell(row=current_row, column=4, value=f"=SUM(D{sec_start_row}:D{sec_end_row})").font = font_bold
+        ws.cell(row=current_row, column=5, value=f"=SUM(E{sec_start_row}:E{sec_end_row})").font = font_bold
+        ws.cell(row=current_row, column=6, value=f"=SUM(F{sec_start_row}:F{sec_end_row})").font = font_bold
+
+        for c in range(2, 7):
+            ws.cell(row=current_row, column=c).alignment = Alignment(horizontal="center", vertical="center")
+        for c in range(1, 7):
+            c_cell = ws.cell(row=current_row, column=c)
+            c_cell.border = border_cell
+            c_cell.fill = subtotal_fill
+        ws.row_dimensions[current_row].height = 22
+        subtotal_rows.append(current_row)
+        current_row += 1
+
+    ws.cell(row=current_row, column=1, value="GRAND TOTAL").font = font_grand
+    ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    cols = ['B', 'C', 'D', 'E', 'F']
+    for c_idx, col_letter in enumerate(cols, 2):
+        cell_refs = ",".join([f"{col_letter}{r}" for r in subtotal_rows])
+        ws.cell(row=current_row, column=c_idx, value=f"=SUM({cell_refs})").font = font_grand
+        ws.cell(row=current_row, column=c_idx).alignment = Alignment(horizontal="center", vertical="center")
+
+    for c in range(1, 7):
+        c_cell = ws.cell(row=current_row, column=c)
+        c_cell.border = border_grand
+        c_cell.fill = primary_fill
+
+    ws.row_dimensions[current_row].height = 24
+    ws.column_dimensions['A'].width = 38
+    for col in ['B', 'C', 'D', 'E', 'F']:
+        ws.column_dimensions[col].width = 16
+
+    wb.save(output_path)
+
 def generate_all_reports_suite(df, leave_mapping):
     df_filtered = apply_leave_and_status_filtering(df, leave_mapping)
     
@@ -695,7 +1312,11 @@ def generate_all_reports_suite(df, leave_mapping):
     os.makedirs(output_dir, exist_ok=True)
 
     save_records_to_db(df)
+    generate_interactive_master_workbook(df_filtered, os.path.join(output_dir, "Master_Hierarchical_Attendance.xlsx"))
+    generate_excel_report(df, leave_mapping, os.path.join(output_dir, "Daily_Attendance_Executive_Summary.xlsx"))
+
     return os.path.abspath(output_dir)
+
 
 def calculate_student_fine_breakdown(emp_df, is_inliving=False):
     absent_records = emp_df[emp_df['is_absent'] == 1].copy()
