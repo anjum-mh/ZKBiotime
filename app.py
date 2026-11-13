@@ -226,11 +226,22 @@ def load_all_attendance_logs():
     conn = sqlite3.connect(DB_FILE)
     try:
         df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
+        profiles_df = pd.read_sql_query("SELECT emp_id, status, withdrawal_date FROM student_profiles", conn)
     except Exception:
         df = pd.DataFrame()
+        profiles_df = pd.DataFrame()
     conn.close()
+    
     if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
+        if not profiles_df.empty:
+            profiles_df['emp_id'] = profiles_df['emp_id'].apply(normalize_emp_id)
+            withdrawn_profiles = profiles_df[profiles_df['status'] == 'Withdrawn']
+            for _, w_row in withdrawn_profiles.iterrows():
+                w_id = w_row['emp_id']
+                w_date = w_row['withdrawal_date']
+                if w_date:
+                    df = df[~((df['emp_id'] == w_id) & (df['record_date'] >= w_date))]
     return df
 
 def load_student_profiles():
@@ -252,6 +263,11 @@ def update_student_status(emp_id, status, date_str):
         c.execute('''
             UPDATE student_profiles SET status = ?, withdrawal_date = ? WHERE TRIM(emp_id) = TRIM(?)
         ''', (status, date_str, norm_id))
+        c.execute('''
+            UPDATE attendance_logs 
+            SET is_present = 0, is_absent = 0, is_leave = 0, is_late = 0, clock_in = '', excuse_reason = 'Withdrawn'
+            WHERE TRIM(emp_id) = TRIM(?) AND record_date >= ?
+        ''', (norm_id, date_str))
     else:
         c.execute('''
             UPDATE student_profiles SET status = ?, reinstated_date = ? WHERE TRIM(emp_id) = TRIM(?)
@@ -259,9 +275,25 @@ def update_student_status(emp_id, status, date_str):
     conn.commit()
     conn.close()
 
+OFFICIAL_INSTRUCTORS = [
+    "Muhammad Masab Zafar",
+    "Ayesha Hussain",
+    "Sidra Zaidi",
+    "Omair Tahir",
+    "Muhammad Mudabbir Saeed",
+    "Ammad Basir",
+    "Mazhar Jamil",
+    "Hassan Ayaz",
+    "Syed Ali Raza",
+    "Tahira Kanwal",
+    "Erum Shabbir"
+]
+
 if 'authenticated' not in st.session_state:
     st.session_state['authenticated'] = False
+if 'role' not in st.session_state:
     st.session_state['role'] = None
+if 'username' not in st.session_state:
     st.session_state['username'] = ""
 
 if not st.session_state['authenticated']:
@@ -271,7 +303,7 @@ if not st.session_state['authenticated']:
     col1, col2, col3 = st.columns([1, 1.3, 1])
     with col2:
         if os.path.exists("ctti_logo.png"):
-            st.image("ctti_logo.png", width=120, use_column_width=False)
+            st.image("ctti_logo.png", width=120)
             
         st.markdown("""
         <div style="text-align: center; margin-bottom: 20px;">
@@ -280,41 +312,51 @@ if not st.session_state['authenticated']:
         </div>
         """, unsafe_allow_html=True)
         
-        with st.form("login_form"):
-            role_choice = st.selectbox("Select Access Role:", ["Admin (Full Access)", "Instructor Portal", "Viewer (Read-Only)"])
-            username_input = st.text_input("Instructor / User Name (Optional for Admin/Viewer):", value="")
-            password_input = st.text_input("Enter Security Key:", type="password")
-            st.markdown("<br>", unsafe_allow_html=True)
-            submit_login = st.form_submit_button("Authenticate & Enter Hub", type="primary", use_container_width=True)
+        st.markdown("### 🔐 CTTI Portal Authentication")
+        role_choice = st.selectbox("Select Access Role:", ["Admin (Full Access)", "Instructor Portal", "Viewer (Read-Only)"])
+
+        final_username = ""
+        if role_choice == "Instructor Portal":
+            selected_instructor = st.selectbox("Select Instructor Name:", ["-- Select --"] + OFFICIAL_INSTRUCTORS + ["Other / Manual Entry"])
+            if selected_instructor == "Other / Manual Entry":
+                final_username = st.text_input("Enter Full Name Manually:").strip()
+            elif selected_instructor != "-- Select --":
+                final_username = selected_instructor
+        else:
+            final_username = st.text_input("User Name (Optional for Admin/Viewer):", value="").strip()
+
+        password_input = st.text_input("Enter Security Key:", type="password")
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.button("Authenticate & Enter Hub", type="primary", use_container_width=True):
+            current_admin_pass = get_db_password('admin_pass')
+            current_instructor_pass = get_db_password('instructor_pass')
+            current_viewer_pass = get_db_password('viewer_pass')
             
-            if submit_login:
-                current_admin_pass = get_db_password('admin_pass')
-                current_instructor_pass = get_db_password('instructor_pass')
-                current_viewer_pass = get_db_password('viewer_pass')
-                
-                if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
-                    st.session_state['authenticated'] = True
-                    st.session_state['role'] = 'Admin'
-                    st.session_state['username'] = username_input.strip() or "Administrator"
-                    st.query_params["role"] = "Admin"
-                    st.rerun()
-                elif role_choice == "Instructor Portal" and password_input == current_instructor_pass:
-                    if not username_input.strip():
-                        st.error("❌ Please enter your Instructor Name before logging in.")
-                    else:
-                        st.session_state['authenticated'] = True
-                        st.session_state['role'] = 'Instructor'
-                        st.session_state['username'] = username_input.strip()
-                        st.query_params["role"] = "Instructor"
-                        st.rerun()
-                elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
-                    st.session_state['authenticated'] = True
-                    st.session_state['role'] = 'Viewer'
-                    st.session_state['username'] = username_input.strip() or "Executive Viewer"
-                    st.query_params["role"] = "Viewer"
-                    st.rerun()
+            if role_choice == "Admin (Full Access)" and password_input == current_admin_pass:
+                st.session_state['authenticated'] = True
+                st.session_state['role'] = 'Admin'
+                st.session_state['username'] = final_username or "Administrator"
+                st.query_params["role"] = "Admin"
+                st.rerun()
+            elif role_choice == "Instructor Portal" and password_input == current_instructor_pass:
+                if not final_username:
+                    st.error("❌ Please select or enter your instructor name.")
                 else:
-                    st.error("❌ Invalid security key or missing name. Access denied.")
+                    st.session_state['authenticated'] = True
+                    st.session_state['role'] = 'Instructor'
+                    st.session_state['username'] = final_username
+                    st.query_params["role"] = "Instructor"
+                    st.rerun()
+            elif role_choice == "Viewer (Read-Only)" and password_input == current_viewer_pass:
+                st.session_state['authenticated'] = True
+                st.session_state['role'] = 'Viewer'
+                st.session_state['username'] = final_username or "Executive Viewer"
+                st.query_params["role"] = "Viewer"
+                st.rerun()
+            else:
+                st.error("❌ Invalid security key or missing username. Access denied.")
+
     st.stop()
 
 with st.sidebar:
@@ -400,29 +442,34 @@ def manual_attendance_override(emp_id, date_str, shift_name, new_status, clock_i
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     norm_id = normalize_emp_id(emp_id)
+    clean_date = str(date_str).strip()[:10]
+    clean_shift = str(shift_name).strip()
     
     is_pres = 1 if new_status in ['Present', 'Late'] else 0
     is_abs = 1 if new_status == 'Absent' else 0
     is_lea = 1 if new_status == 'Leave' else 0
     is_lat = 1 if new_status == 'Late' else 0
-    
-    if "Second Shift" in shift_name and "Friday" not in shift_name:
-        c.execute('''
-            SELECT shift_name FROM attendance_logs 
-            WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND shift_name LIKE '%Second Shift%Friday%'
-        ''', (norm_id, str(date_str).strip()))
-        match = c.fetchone()
-        if match:
-            shift_name = match[0]
 
     c.execute('''
         UPDATE attendance_logs
         SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
-        WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
-    ''', (is_pres, is_abs, is_lea, is_lat, str(clock_in_time).strip(), str(reason).strip(), norm_id, str(date_str).strip(), str(shift_name).strip()))
+        WHERE TRIM(emp_id) = TRIM(?) AND SUBSTR(TRIM(record_date), 1, 10) = ? AND TRIM(shift_name) = ?
+    ''', (is_pres, is_abs, is_lea, is_lat, str(clock_in_time).strip(), str(reason).strip(), norm_id, clean_date, clean_shift))
+    
+    affected = c.rowcount
+    # Fallback: match base shift prefix (e.g., 'First Shift' or 'Second Shift') if Friday suffix differed
+    if affected == 0:
+        base_shift = clean_shift.split('(')[0].strip()
+        c.execute('''
+            UPDATE attendance_logs
+            SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
+            WHERE TRIM(emp_id) = TRIM(?) AND SUBSTR(TRIM(record_date), 1, 10) = ? AND TRIM(shift_name) LIKE ?
+        ''', (is_pres, is_abs, is_lea, is_lat, str(clock_in_time).strip(), str(reason).strip(), norm_id, clean_date, f"{base_shift}%"))
+        affected = c.rowcount
     
     conn.commit()
     conn.close()
+    return affected
 
 def parse_dept_header(dept_str):
     clean_str = str(dept_str).replace('Department:', '').strip().upper()
@@ -477,6 +524,7 @@ def detect_shift_and_threshold(df_records):
 
     late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:10'
     return shift_name, late_threshold, is_friday
+
 
 def parse_biotime_excel(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
@@ -1717,7 +1765,9 @@ if target_leave_inst_tab or user_role == 'Admin':
                             st.rerun()
 
             st.markdown("---")
-            st.markdown("#### 📊 Your Submitted Requests Status Tracker")
+            st.markdown("#### 📊 Your Submitted Requests Status Tracker & Cancellation")
+            st.info("💡 If you made a mistake on a **Pending** request, you can cancel it directly below so it can be re-submitted correctly.")
+            
             conn_q = sqlite3.connect(DB_FILE)
             my_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE instructor_name = ? ORDER BY request_id DESC", conn_q, params=(st.session_state['username'],))
             conn_q.close()
@@ -1725,7 +1775,34 @@ if target_leave_inst_tab or user_role == 'Admin':
             if my_reqs.empty:
                 st.info("You have not submitted any leave requests yet.")
             else:
-                st.dataframe(my_reqs[['request_id', 'emp_id', 'student_name', 'dept_code', 'start_date', 'end_date', 'leave_type', 'reason', 'status', 'admin_remarks', 'submitted_at']], use_container_width=True)
+                for _, r_row in my_reqs.iterrows():
+                    rid = r_row['request_id']
+                    st_name = r_row['student_name']
+                    st_id = r_row['emp_id']
+                    st_sec = r_row['dept_code']
+                    st_start = r_row['start_date']
+                    st_end = r_row['end_date']
+                    st_type = r_row['leave_type']
+                    st_stat = r_row['status']
+                    st_rem = r_row['admin_remarks']
+                    
+                    col_t1, col_t2 = st.columns([3, 1])
+                    with col_t1:
+                        st.markdown(f"**Request #{rid}** | Student: **{st_name}** (`{st_id}`) — Section `{st_sec}`")
+                        st.write(f"Dates: `{st_start}` to `{st_end}` | Type: `{st_type}` | Status: **{st_stat}**")
+                        if st_rem:
+                            st.write(f"Remarks: _{st_rem}_")
+                    with col_t2:
+                        if st_stat == 'Pending':
+                            if st.button(f"🗑️ Cancel Request #{rid}", key=f"cancel_req_{rid}", use_container_width=True):
+                                conn_c = sqlite3.connect(DB_FILE)
+                                cc = conn_c.cursor()
+                                cc.execute("DELETE FROM leave_requests WHERE request_id = ? AND status = 'Pending'", (rid,))
+                                conn_c.commit()
+                                conn_c.close()
+                                st.success(f"Request #{rid} cancelled successfully.")
+                                st.rerun()
+                    st.markdown("---")
 
 # --- TAB 2: WARNINGS, OVERRIDES & STUDENT LIFECYCLE PORTAL ---
 if user_role in ['Admin', 'Viewer']:
@@ -1830,7 +1907,7 @@ if user_role in ['Admin', 'Viewer']:
                         selected_date_opt = st.selectbox("Select Date & Shift Record to Update:", date_shift_opts)
                         
                         target_date = selected_date_opt.split(" | ")[0].strip()
-                        target_shift = selected_date_opt.split(" | ")[1].split(" (")[0].strip()
+                        target_shift = selected_date_opt.split(" | ")[1].rsplit(" (Current:", 1)[0].strip()
                         
                         col_ov1, col_ov2, col_ov3 = st.columns(3)
                         with col_ov1:
@@ -1841,9 +1918,12 @@ if user_role in ['Admin', 'Viewer']:
                             override_reason = st.text_input("Reason / Note:", value="Manual Correction" if target_status == "Present" else "Reported by Class Rep", key="target_reason")
 
                         if st.button("💾 Apply Manual Override", type="primary", use_container_width=True):
-                            manual_attendance_override(sel_emp_id, target_date, target_shift, target_status, target_time, override_reason)
-                            st.success(f"Successfully updated record for Student {sel_emp_id} on {target_date} ({target_shift}) to {target_status}!")
-                            st.rerun()
+                            rows_updated = manual_attendance_override(sel_emp_id, target_date, target_shift, target_status, target_time, override_reason)
+                            if rows_updated > 0:
+                                st.success(f"Successfully updated record for Student {sel_emp_id} on {target_date} ({target_shift}) to {target_status}!")
+                                st.rerun()
+                            else:
+                                st.warning(f"⚠️ No matching database row found for Student {sel_emp_id} on {target_date} ({target_shift}).")
 
                 st.markdown("---")
                 st.markdown("### ⚡ Bulk Section Attendance Override (Power Outage Mode)")
@@ -1881,10 +1961,18 @@ if user_role in ['Admin', 'Viewer']:
                         c.execute('''
                             UPDATE attendance_logs
                             SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
-                            WHERE TRIM(dept_code) = TRIM(?) AND TRIM(record_date) = TRIM(?) AND TRIM(shift_name) = TRIM(?)
+                            WHERE TRIM(dept_code) = TRIM(?) AND SUBSTR(TRIM(record_date), 1, 10) = ? AND TRIM(shift_name) = TRIM(?)
                         ''', (is_pres, is_abs, is_lea, is_lat, str(bulk_time).strip(), str(bulk_reason).strip(), str(bulk_section).strip(), target_d_str, str(bulk_shift).strip()))
                         
                         affected_rows = c.rowcount
+                        if affected_rows == 0:
+                            base_bulk_shift = str(bulk_shift).split('(')[0].strip()
+                            c.execute('''
+                                UPDATE attendance_logs
+                                SET is_present = ?, is_absent = ?, is_leave = ?, is_late = ?, clock_in = ?, excuse_reason = ?
+                                WHERE TRIM(dept_code) = TRIM(?) AND SUBSTR(TRIM(record_date), 1, 10) = ? AND TRIM(shift_name) LIKE ?
+                            ''', (is_pres, is_abs, is_lea, is_lat, str(bulk_time).strip(), str(bulk_reason).strip(), str(bulk_section).strip(), target_d_str, f"{base_bulk_shift}%"))
+                            affected_rows = c.rowcount
                         conn.commit()
                         conn.close()
                         
@@ -1901,89 +1989,108 @@ if user_role == 'Admin':
         st.markdown("### 📩 Instructor Leave Requests Queue & Validation Hub")
         st.info("💡 Review pending multi-day leave requests submitted by instructors. The system automatically cross-references records to detect clock-in conflicts.")
 
-        conn_adm = sqlite3.connect(DB_FILE)
-        pending_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE status = 'Pending' ORDER BY request_id ASC", conn_adm)
-        all_logs_chk = pd.read_sql_query("SELECT * FROM attendance_logs", conn_adm)
-        conn_adm.close()
+        sub_tab_p, sub_tab_h = st.tabs(["⏳ Pending Requests Queue", "📜 Approval & Rejection History"])
 
-        if pending_reqs.empty:
-            st.success("🎉 No pending leave requests in the queue!")
-        else:
-            for _, req in pending_reqs.iterrows():
-                r_id = req['request_id']
-                e_id = normalize_emp_id(req['emp_id'])
-                s_name = req['student_name']
-                sec = req['dept_code']
-                s_date = req['start_date']
-                e_date = req['end_date']
-                l_type = req['leave_type']
-                reason = req['reason']
-                inst = req['instructor_name']
-                sub_at = req['submitted_at']
+        with sub_tab_p:
+            conn_adm = sqlite3.connect(DB_FILE)
+            pending_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE status = 'Pending' ORDER BY request_id ASC", conn_adm)
+            all_logs_chk = pd.read_sql_query("SELECT * FROM attendance_logs", conn_adm)
+            conn_adm.close()
 
-                # Conflict Check: Did student clock in on any of those dates?
-                conflict_found = False
-                conflict_dates = []
-                if not all_logs_chk.empty:
-                    d_cur = datetime.strptime(s_date, '%Y-%m-%d')
-                    d_end = datetime.strptime(e_date, '%Y-%m-%d')
-                    while d_cur <= d_end:
-                        chk_str = d_cur.strftime('%Y-%m-%d')
-                        match_row = all_logs_chk[(all_logs_chk['emp_id'] == e_id) & (all_logs_chk['record_date'] == chk_str) & (all_logs_chk['is_present'] == 1)]
-                        if not match_row.empty:
-                            conflict_found = True
-                            conflict_dates.append(chk_str)
-                        d_cur += timedelta(days=1)
+            if pending_reqs.empty:
+                st.success("🎉 No pending leave requests in the queue!")
+            else:
+                st.markdown(f"#### Pending Review Queue ({len(pending_reqs)} requests)")
+                for _, req in pending_reqs.iterrows():
+                    r_id = req['request_id']
+                    e_id = normalize_emp_id(req['emp_id'])
+                    s_name = req['student_name']
+                    sec = req['dept_code']
+                    s_date = req['start_date']
+                    e_date = req['end_date']
+                    l_type = req['leave_type']
+                    reason = req['reason']
+                    inst = req['instructor_name']
+                    sub_at = req['submitted_at']
 
-                with st.container():
-                    col_box1, col_box2 = st.columns([3, 1])
-                    with col_box1:
-                        st.markdown(f"#### 🎓 Request #{r_id}: {s_name} (`{e_id}`) — Section `{sec}`")
-                        st.write(f"**Dates:** `{s_date}` to `{e_date}` &nbsp;|&nbsp; **Category:** `{l_type}`")
-                        st.write(f"**Reason / Proof:** {reason}")
-                        st.write(f"**Submitted By Instructor:** `{inst}` at `{sub_at}`")
+                    conflict_found = False
+                    conflict_dates = []
+                    if not all_logs_chk.empty:
+                        d_cur = datetime.strptime(s_date, '%Y-%m-%d')
+                        d_end = datetime.strptime(e_date, '%Y-%m-%d')
+                        while d_cur <= d_end:
+                            chk_str = d_cur.strftime('%Y-%m-%d')
+                            match_row = all_logs_chk[(all_logs_chk['emp_id'] == e_id) & (all_logs_chk['record_date'] == chk_str) & (all_logs_chk['is_present'] == 1)]
+                            if not match_row.empty:
+                                conflict_found = True
+                                conflict_dates.append(chk_str)
+                            d_cur += timedelta(days=1)
 
-                        if conflict_found:
-                            st.error(f"⚠️ **CLOCK-IN CONFLICT DETECTED:** Student clocked in as PRESENT on: `{', '.join(conflict_dates)}`. Approving will convert these to excused leave.")
-                        else:
-                            st.success("✅ No clock-In conflicts found for this date range.")
+                    with st.container():
+                        col_box1, col_box2 = st.columns([3, 1])
+                        with col_box1:
+                            st.markdown(f"#### 🎓 Request #{r_id}: {s_name} (`{e_id}`) — Section `{sec}`")
+                            st.write(f"**Dates:** `{s_date}` to `{e_date}` &nbsp;|&nbsp; **Category:** `{l_type}`")
+                            st.write(f"**Reason / Proof:** {reason}")
+                            st.write(f"**Submitted By Instructor:** `{inst}` at `{sub_at}`")
 
-                    with col_box2:
-                        admin_note = st.text_input("Admin Remarks", key=f"adm_rem_{r_id}")
-                        c_app, c_rej = st.columns(2)
-                        with c_app:
-                            if st.button("✅ Approve", key=f"app_{r_id}", use_container_width=True):
-                                # Update leave_requests status
-                                conn_up = sqlite3.connect(DB_FILE)
-                                c_up = conn_up.cursor()
-                                c_up.execute("UPDATE leave_requests SET status = 'Approved', admin_remarks = ? WHERE request_id = ?", (admin_note or "Approved by Admin", r_id))
-                                
-                                # Apply leave across date range in attendance_logs
-                                d_cur = datetime.strptime(s_date, '%Y-%m-%d')
-                                d_end = datetime.strptime(e_date, '%Y-%m-%d')
-                                while d_cur <= d_end:
-                                    chk_str = d_cur.strftime('%Y-%m-%d')
-                                    c_up.execute('''
-                                        UPDATE attendance_logs
-                                        SET is_absent = 0, is_leave = 1, excuse_reason = ?
-                                        WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?)
-                                    ''', (f"Approved Leave ({l_type}): {reason}", e_id, chk_str))
+                            if conflict_found:
+                                st.error(f"⚠️ **CLOCK-IN CONFLICT DETECTED:** Student clocked in as PRESENT on: `{', '.join(conflict_dates)}`. Approving will convert these to excused leave.")
+                            else:
+                                st.success("✅ No clock-In conflicts found for this date range.")
+
+                        with col_box2:
+                            admin_note = st.text_input("Admin Remarks", key=f"adm_rem_{r_id}")
+                            c_app, c_rej = st.columns(2)
+                            with c_app:
+                                if st.button("✅ Approve", key=f"app_{r_id}", use_container_width=True):
+                                    conn_up = sqlite3.connect(DB_FILE)
+                                    c_up = conn_up.cursor()
+                                    c_up.execute("UPDATE leave_requests SET status = 'Approved', admin_remarks = ? WHERE request_id = ?", (admin_note or "Approved by Admin", r_id))
+                                    
+                                    d_cur = datetime.strptime(s_date, '%Y-%m-%d')
+                                    d_end = datetime.strptime(e_date, '%Y-%m-%d')
+                                    while d_cur <= d_end:
+                                        chk_str = d_cur.strftime('%Y-%m-%d')
+                                        c_up.execute('''
+                                            UPDATE attendance_logs
+                                            SET is_absent = 0, is_leave = 1, excuse_reason = ?
+                                            WHERE TRIM(emp_id) = TRIM(?) AND TRIM(record_date) = TRIM(?)
+                                        ''', (f"Approved Leave ({l_type}): {reason}", e_id, chk_str))
+                                        conn_up.commit()
+                                        d_cur += timedelta(days=1)
+                                    conn_up.close()
+                                    st.success(f"Request #{r_id} Approved & Attendance Logs Updated!")
+                                    st.rerun()
+
+                            with c_rej:
+                                if st.button("❌ Reject", key=f"rej_{r_id}", use_container_width=True):
+                                    conn_up = sqlite3.connect(DB_FILE)
+                                    c_up = conn_up.cursor()
+                                    c_up.execute("UPDATE leave_requests SET status = 'Rejected', admin_remarks = ? WHERE request_id = ?", (admin_note or "Rejected by Admin", r_id))
                                     conn_up.commit()
-                                    d_cur += timedelta(days=1)
-                                conn_up.close()
-                                st.success(f"Request #{r_id} Approved & Attendance Logs Updated!")
-                                st.rerun()
+                                    conn_up.close()
+                                    st.warning(f"Request #{r_id} Rejected.")
+                                    st.rerun()
+                        st.markdown("---")
 
-                        with c_rej:
-                            if st.button("❌ Reject", key=f"rej_{r_id}", use_container_width=True):
-                                conn_up = sqlite3.connect(DB_FILE)
-                                c_up = conn_up.cursor()
-                                c_up.execute("UPDATE leave_requests SET status = 'Rejected', admin_remarks = ? WHERE request_id = ?", (admin_note or "Rejected by Admin", r_id))
-                                conn_up.commit()
-                                conn_up.close()
-                                st.warning(f"Request #{r_id} Rejected.")
-                                st.rerun()
-                    st.markdown("---")
+        with sub_tab_h:
+            conn_h = sqlite3.connect(DB_FILE)
+            history_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE status IN ('Approved', 'Rejected') ORDER BY request_id DESC", conn_h)
+            conn_h.close()
+
+            if history_reqs.empty:
+                st.info("No processed leave requests in history yet.")
+            else:
+                total_approved = len(history_reqs[history_reqs['status'] == 'Approved'])
+                total_rejected = len(history_reqs[history_reqs['status'] == 'Rejected'])
+                
+                ha1, ha2 = st.columns(2)
+                ha1.metric("Total Approved Leaves", total_approved)
+                ha2.metric("Total Rejected Leaves", total_rejected)
+                
+                st.markdown("---")
+                st.dataframe(history_reqs[['request_id', 'emp_id', 'student_name', 'dept_code', 'start_date', 'end_date', 'leave_type', 'instructor_name', 'status', 'admin_remarks', 'submitted_at']], use_container_width=True)
 
 # --- TAB 3: STUDENT PROFILE SEARCH ---
 if user_role == 'Admin':
@@ -2355,3 +2462,6 @@ with current_fine_tab:
                         'Warnings': warning_map.get(e_id, "Normal")
                     })
                 st.dataframe(pd.DataFrame(fin_summary_data), use_container_width=True)
+
+
+
