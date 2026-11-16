@@ -32,71 +32,25 @@ st.markdown(f"""
         font-family: 'Inter', sans-serif;
     }}
     
-    .stApp {{
-        background-color: #0F172A;
-        color: #F8FAFC;
+    /* Professional Fine Settlement Grid Styling */
+    [data-testid="stForm"] {{
+        background: var(--surface-card, #162033) !important;
+        border: 1px solid var(--border-color, #334155) !important;
+        border-radius: 12px !important;
+        padding: 20px !important;
     }}
     
-    .login-bg-overlay {{
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100vw;
-        height: 100vh;
-        background-image: linear-gradient(rgba(15, 23, 42, 0.85), rgba(15, 23, 42, 0.92)), url("data:image/jpeg;base64,{campus_bg_b64}");
-        background-size: cover;
-        background-position: center;
-        z-index: -1;
-    }}
-    
-    .login-card {{
-        background: rgba(30, 41, 59, 0.80);
-        backdrop-filter: blur(20px);
-        -webkit-backdrop-filter: blur(20px);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        padding: 40px;
-        border-radius: 24px;
-        box-shadow: 0 25px 50px rgba(0, 0, 0, 0.5);
-    }}
-    
-    .stTabs [data-baseweb="tab-list"] {{
-        gap: 8px;
-        background-color: #1E293B;
-        padding: 8px;
-        border-radius: 12px;
-        border: 1px solid #334155;
-    }}
-    .stTabs [data-baseweb="tab"] {{
-        background-color: transparent;
-        border-radius: 8px;
-        color: #94A3B8;
-        font-weight: 600;
-        padding: 10px 18px;
-        transition: all 0.2s ease;
-    }}
-    .stTabs [aria-selected="true"] {{
-        background: linear-gradient(135deg, #2563EB, #1D4ED8) !important;
-        color: white !important;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
-    }}
-    
-    .stButton button {{
-        border-radius: 10px;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        transition: all 0.2s ease;
-    }}
-    .stButton button:hover {{
-        transform: translateY(-2px);
-        box-shadow: 0 6px 15px rgba(59, 130, 246, 0.3);
-    }}
-    
-    [data-testid="stSidebar"] {{
-        background-color: #0B0F19;
-        border-right: 1px solid #1E293B;
+    /* Give input fields inside the fine grid a polished look */
+    [data-testid="stForm"] input {{
+        background-color: var(--input-bg, #0F172A) !important;
+        border: 1px solid var(--border-color, #475569) !important;
+        border-radius: 8px !important;
+        color: var(--text-color, #F8FAFC) !important;
+        text-align: center !important;
     }}
 </style>
 """, unsafe_allow_html=True)
+
 
 DB_FILE = "attendance_history.db"
 
@@ -1690,12 +1644,14 @@ with target_archive_tab:
 
         c_sh, c_sec = st.columns(2)
         with c_sh:
-            selected_shifts = st.multiselect("Filter Shift(s):", available_shifts, default=available_shifts, key=f"{user_role}_archive_shifts")
+            selected_shifts = st.multiselect("Filter Shift(s):", available_shifts, default=[], key=f"{user_role}_archive_shifts")
         with c_sec:
-            selected_sections = st.multiselect("Filter Section(s):", available_sections, default=available_sections, key=f"{user_role}_archive_sections")
+            selected_sections = st.multiselect("Filter Section(s):", available_sections, default=[], key=f"{user_role}_archive_sections")
 
-        if date_range_logs.empty or not selected_shifts or not selected_sections:
-            st.warning("No attendance records match the selected date range, shift, or section filters.")
+        if date_range_logs.empty:
+            st.warning("No attendance records found in the selected date range.")
+        elif not selected_shifts or not selected_sections:
+            st.info("💡 Please select at least one **Shift** and one **Section** above to view the attendance records.")
         else:
             filtered_logs = date_range_logs[
                 date_range_logs['shift_name'].isin(selected_shifts) & 
@@ -1885,6 +1841,51 @@ if user_role in ['Admin', 'Viewer']:
                         update_student_status(sel_life_id, new_target_status, status_date.strftime('%Y-%m-%d'))
                         st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}**!")
                         st.rerun()
+                st.markdown("---")
+                st.markdown("### ➕ Register a Missing Student")
+                st.caption("Manually add a student who was omitted from the biometric export, class list, or registered late.")
+
+                with st.form("register_missing_student_form"):
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    with col_m1:
+                        missing_id = st.text_input("Student ID (EmpID):", placeholder="e.g., 10425")
+                    with col_m2:
+                        missing_name = st.text_input("Full Name:", placeholder="e.g., Muhammad Ali")
+                    with col_m3:
+                        existing_sections = sorted(df_db['dept_code'].unique().tolist()) if not df_db.empty else ['ICT-1-A', 'CIV-1-A']
+                        missing_section = st.selectbox("Assign Section / Dept Code:", existing_sections)
+
+                    submit_missing = st.form_submit_button("💾 Register Missing Student", type="primary", use_container_width=True)
+
+                    if submit_missing:
+                        if not missing_id.strip() or not missing_name.strip():
+                            st.error("❌ Student ID and Name cannot be empty.")
+                        else:
+                            norm_m_id = normalize_emp_id(missing_id)
+                            conn_reg = sqlite3.connect(DB_FILE)
+                            c_reg = conn_reg.cursor()
+                            
+                            c_reg.execute("SELECT emp_id FROM student_profiles WHERE TRIM(emp_id) = TRIM(?)", (norm_m_id,))
+                            exists = c_reg.fetchone()
+                            
+                            if exists:
+                                st.warning(f"⚠️ Student ID `{norm_m_id}` already exists in database records.")
+                            else:
+                                c_reg.execute('''
+                                    INSERT INTO student_profiles (emp_id, name, dept_code, status)
+                                    VALUES (?, ?, ?, 'Active')
+                                ''', (norm_m_id, missing_name.strip(), missing_section.strip()))
+                                conn_reg.commit()
+                                conn_reg.close()
+                                st.success(f"✅ Successfully registered student **{missing_name}** (`{norm_m_id}`) under section `{missing_section}`!")
+                                st.rerun()
+
+                st.markdown("---")
+                st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
+                st.caption("Use this section to correct individual student log entries or record direct leaves.")
+
+
+
 
                 st.markdown("---")
                 st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
@@ -2375,7 +2376,6 @@ with current_fine_tab:
                             <td>Rs. {item['Auto_Fine']}</td>
                             <td>Rs. {item['Disc_Fine']}</td>
                             <td>Rs. {item['Total']}</td>
-                            <td>{item['Warnings']}</td>
                             <td style="text-align: left;">{item['Remarks']}</td>
                         </tr>
                         """
@@ -2408,7 +2408,6 @@ with current_fine_tab:
                                     <th>Auto Fine</th>
                                     <th>Disc.</th>
                                     <th>Total (Rs.)</th>
-                                    <th>Warnings</th>
                                     <th>Remarks</th>
                                 </tr>
                             </thead>
@@ -2416,11 +2415,12 @@ with current_fine_tab:
                                 {fine_rows_html}
                                 <tr class="grand">
                                     <td colspan="2">GRAND TOTAL</td>
-                                    <td>{tot_abs_sum}</td>
-                                    <td>{tot_late_sum}</td>
+                                    <td></td>
+                                    <td></td>
                                     <td>Rs. {tot_auto_fine_sum:,}</td>
                                     <td>Rs. {tot_disc_fine_sum:,}</td>
                                     <td>Rs. {tot_grand_sum:,}</td>
+                                    <td></td>
                                     <td colspan="2"></td>
                                 </tr>
                             </tbody>
