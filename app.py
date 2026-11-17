@@ -196,6 +196,13 @@ def load_all_attendance_logs():
                 w_date = w_row['withdrawal_date']
                 if w_date:
                     df = df[~((df['emp_id'] == w_id) & (df['record_date'] >= w_date))]
+
+    # --- GLOBAL DEPARTMENT SCOPE FILTER FOR INSTRUCTORS & VIEWERS ---
+    if st.session_state.get('role') in ['Instructor', 'Viewer'] and st.session_state.get('selected_parent_dept'):
+        target_p_dept = st.session_state['selected_parent_dept']
+        if not df.empty and 'parent_dept' in df.columns:
+            df = df[df['parent_dept'] == target_p_dept]
+
     return df
 
 def load_student_profiles():
@@ -207,6 +214,15 @@ def load_student_profiles():
     conn.close()
     if not df.empty and 'emp_id' in df.columns:
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
+        
+    # Filter profiles for non-admin roles based on selected parent department via matching dept_code prefix
+    if st.session_state.get('role') in ['Instructor', 'Viewer'] and st.session_state.get('selected_parent_dept'):
+        target_p_dept = st.session_state['selected_parent_dept']
+        if not df.empty and 'dept_code' in df.columns:
+            valid_dept_codes = [code for code, (p_name, _) in PREFIX_MAP.items() if p_name == target_p_dept]
+            # Also match sub_dept or dept prefix
+            df = df[df['dept_code'].apply(lambda x: any(str(x).startswith(prefix) for prefix in valid_dept_codes))]
+
     return df
 
 def update_student_status(emp_id, status, date_str):
@@ -230,6 +246,7 @@ def update_student_status(emp_id, status, date_str):
     conn.close()
 
 OFFICIAL_INSTRUCTORS = [
+    "Mobin Al Azim",
     "Muhammad Masab Zafar",
     "Ayesha Hussain",
     "Sidra Zaidi",
@@ -240,7 +257,11 @@ OFFICIAL_INSTRUCTORS = [
     "Hassan Ayaz",
     "Syed Ali Raza",
     "Tahira Kanwal",
-    "Erum Shabbir"
+    "Erum Shabbir",
+    "Muneeb Rashid",
+    "Asim Faseeh",
+    "Qadeer Asghar",
+    "Atif Sudheer"
 ]
 
 if 'authenticated' not in st.session_state:
@@ -249,6 +270,8 @@ if 'role' not in st.session_state:
     st.session_state['role'] = None
 if 'username' not in st.session_state:
     st.session_state['username'] = ""
+if 'selected_parent_dept' not in st.session_state:
+    st.session_state['selected_parent_dept'] = None
 
 if not st.session_state['authenticated']:
     st.markdown('<div class="login-bg-overlay"></div>', unsafe_allow_html=True)
@@ -291,6 +314,7 @@ if not st.session_state['authenticated']:
                 st.session_state['authenticated'] = True
                 st.session_state['role'] = 'Admin'
                 st.session_state['username'] = final_username or "Administrator"
+                st.session_state['selected_parent_dept'] = None
                 st.query_params["role"] = "Admin"
                 st.rerun()
             elif role_choice == "Instructor Portal" and password_input == current_instructor_pass:
@@ -313,15 +337,43 @@ if not st.session_state['authenticated']:
 
     st.stop()
 
+# --- PARENT DEPARTMENT GATE FOR INSTRUCTORS & VIEWERS ---
+if st.session_state['role'] in ['Instructor', 'Viewer'] and not st.session_state.get('selected_parent_dept'):
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col_g1, col_g2, col_g3 = st.columns([1, 1.5, 1])
+    with col_g2:
+        st.markdown("""
+        <div style="background: #1E293B; padding: 25px; border-radius: 12px; border: 1px solid #334155; text-align: center;">
+            <h3 style="color: #F8FAFC; margin-bottom: 5px;">🏢 Select Your Parent Department</h3>
+            <p style="color: #94A3B8; font-size: 13px;">Please select your department scope to enter the dashboard.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        chosen_dept = st.selectbox("Parent Department:", PARENT_ORDER)
+        
+        if st.button("Confirm & Proceed to Dashboard", type="primary", use_container_width=True):
+            st.session_state['selected_parent_dept'] = chosen_dept
+            st.rerun()
+    st.stop()
+
 with st.sidebar:
     if os.path.exists("ctti_logo.png"):
         st.image("ctti_logo.png", width=90)
     st.markdown("### 🛡️ Session Security")
     st.info(f"Connected User:\n**{st.session_state.get('username', 'User')}**\n\nRole:\n**{st.session_state['role']}**")
+    
+    if st.session_state['role'] in ['Instructor', 'Viewer']:
+        st.markdown(f"Department:\n**{st.session_state.get('selected_parent_dept', 'All')}**")
+        if st.button("🔄 Switch Department", use_container_width=True):
+            st.session_state['selected_parent_dept'] = None
+            st.rerun()
+
     if st.button("🚪 Terminate Session", use_container_width=True):
         st.session_state['authenticated'] = False
         st.session_state['role'] = None
         st.session_state['username'] = ""
+        st.session_state['selected_parent_dept'] = None
         if "role" in st.query_params:
             del st.query_params["role"]
         st.rerun()
@@ -411,7 +463,6 @@ def manual_attendance_override(emp_id, date_str, shift_name, new_status, clock_i
     ''', (is_pres, is_abs, is_lea, is_lat, str(clock_in_time).strip(), str(reason).strip(), norm_id, clean_date, clean_shift))
     
     affected = c.rowcount
-    # Fallback: match base shift prefix (e.g., 'First Shift' or 'Second Shift') if Friday suffix differed
     if affected == 0:
         base_shift = clean_shift.split('(')[0].strip()
         c.execute('''
@@ -478,7 +529,6 @@ def detect_shift_and_threshold(df_records):
 
     late_threshold = ('14:15' if is_friday else '13:05') if shift_name == 'Second Shift' else '08:10'
     return shift_name, late_threshold, is_friday
-
 
 def parse_biotime_excel(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
@@ -1465,7 +1515,7 @@ st.markdown(f"""
     <div style="display: flex; justify-content: space-between; align-items: center;">
         <div>
             <h2 style="color: #F8FAFC; margin: 0; font-size: 22px; font-weight: 700;">⚡ CTTI Institutional Command Hub</h2>
-            <p style="color: #94A3B8; margin: 5px 0 0 0; font-size: 13px;">Active User: <strong style="color: #3B82F6;">{st.session_state.get('username', 'User')}</strong> &nbsp;|&nbsp; Role: <strong style="color: #38BDF8;">{st.session_state['role']}</strong></p>
+            <p style="color: #94A3B8; margin: 5px 0 0 0; font-size: 13px;">Active User: <strong style="color: #3B82F6;">{st.session_state.get('username', 'User')}</strong> &nbsp;|&nbsp; Role: <strong style="color: #38BDF8;">{st.session_state['role']}</strong> {f"&nbsp;|&nbsp; Dept Scope: <strong style='color: #FACC15;'>{st.session_state.get('selected_parent_dept', 'All')}</strong>" if st.session_state['role'] != 'Admin' else ""}</p>
         </div>
         <div>
             <span style="background: rgba(16, 185, 129, 0.15); color: #34D399; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid rgba(16, 185, 129, 0.3);">🟢 System Secure</span>
@@ -1879,14 +1929,7 @@ if user_role in ['Admin', 'Viewer']:
                                 conn_reg.close()
                                 st.success(f"✅ Successfully registered student **{missing_name}** (`{norm_m_id}`) under section `{missing_section}`!")
                                 st.rerun()
-
-                st.markdown("---")
-                st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
-                st.caption("Use this section to correct individual student log entries or record direct leaves.")
-
-
-
-
+               
                 st.markdown("---")
                 st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
                 st.caption("Use this section to correct individual student log entries or record direct leaves.")
@@ -2366,17 +2409,18 @@ with current_fine_tab:
 
                 with col_exp2:
                     fine_rows_html = ""
-                    for item in report_items:
+                    for idx, item in enumerate(report_items):
+                        row_bg = "#F8FAFC" if idx % 2 == 1 else "#FFFFFF"
                         fine_rows_html += f"""
-                        <tr>
-                            <td>{item['ID']}</td>
-                            <td style="text-align: left;">{item['Name']}</td>
-                            <td>{item['Absentees']}</td>
-                            <td>{item['Late']}</td>
-                            <td>Rs. {item['Auto_Fine']}</td>
-                            <td>Rs. {item['Disc_Fine']}</td>
-                            <td>Rs. {item['Total']}</td>
-                            <td style="text-align: left;">{item['Remarks']}</td>
+                        <tr style="background-color: {row_bg};">
+                            <td style="padding: 5px 6px; font-weight: 500;">{item['ID']}</td>
+                            <td style="padding: 5px 6px; text-align: left; font-weight: 600;">{item['Name']}</td>
+                            <td style="padding: 5px 6px;">{item['Absentees']}</td>
+                            <td style="padding: 5px 6px;">{item['Late']}</td>
+                            <td style="padding: 5px 6px;">Rs. {item['Auto_Fine']}</td>
+                            <td style="padding: 5px 6px;">Rs. {item['Disc_Fine']}</td>
+                            <td style="padding: 5px 6px; font-weight: bold; color: #1E293B;">Rs. {item['Total']}</td>
+                            <td style="padding: 5px 6px; text-align: left; color: #475569;">{item['Remarks']}</td>
                         </tr>
                         """
 
@@ -2384,15 +2428,16 @@ with current_fine_tab:
                     <html>
                     <head>
                         <style>
-                            @page {{ size: A4 portrait; margin: 4mm; }}
-                            body {{ font-family: 'Century Gothic', sans-serif; color: black; background: white; margin: 0; padding: 0; }}
-                            h2 {{ text-align: center; margin: 0 0 2px 0; font-size: 13pt; color: #1E293B; }}
-                            .sub {{ text-align: center; font-size: 9pt; font-weight: bold; margin-bottom: 6px; color: #475569; }}
-                            table {{ width: 100%; border-collapse: collapse; page-break-inside: auto; }}
+                            @page {{ size: A4 portrait; margin: 10mm; }}
+                            body {{ font-family: 'Century Gothic', Arial, sans-serif; color: #0F172A; background: white; margin: 0; padding: 0; }}
+                            h2 {{ text-align: center; margin: 0 0 4px 0; font-size: 15pt; font-weight: 700; color: #1E293B; letter-spacing: 0.5px; }}
+                            .sub {{ text-align: center; font-size: 10pt; font-weight: 600; margin-bottom: 12px; color: #475569; border-bottom: 2px solid #E2E8F0; padding-bottom: 6px; }}
+                            table {{ width: 100%; border-collapse: collapse; page-break-inside: auto; margin-top: 5px; }}
                             tr {{ page-break-inside: avoid; page-break-after: auto; }}
-                            th, td {{ border: 1px solid #64748B; padding: 3px 3px; text-align: center; font-size: 8pt; white-space: nowrap; }}
-                            th {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
+                            th {{ border: 1px solid #64748B; background-color: #1E293B !important; color: white !important; font-size: 9pt; font-weight: bold; padding: 7px 5px; text-align: center; -webkit-print-color-adjust: exact; }}
+                            td {{ border: 1px solid #CBD5E1; font-size: 8.5pt; color: #1E293B; white-space: nowrap; }}
                             .grand {{ background-color: #1E293B !important; color: white !important; font-weight: bold; -webkit-print-color-adjust: exact; }}
+                            .grand td {{ border: 1px solid #1E293B; color: white !important; font-size: 9.5pt; padding: 7px 5px; text-align: center; }}
                         </style>
                     </head>
                     <body>
@@ -2414,14 +2459,13 @@ with current_fine_tab:
                             <tbody>
                                 {fine_rows_html}
                                 <tr class="grand">
-                                    <td colspan="2">GRAND TOTAL</td>
+                                    <td colspan="2" style="text-align: center; font-weight: bold;">GRAND TOTAL</td>
                                     <td></td>
                                     <td></td>
                                     <td>Rs. {tot_auto_fine_sum:,}</td>
                                     <td>Rs. {tot_disc_fine_sum:,}</td>
                                     <td>Rs. {tot_grand_sum:,}</td>
                                     <td></td>
-                                    <td colspan="2"></td>
                                 </tr>
                             </tbody>
                         </table>
@@ -2462,6 +2506,3 @@ with current_fine_tab:
                         'Warnings': warning_map.get(e_id, "Normal")
                     })
                 st.dataframe(pd.DataFrame(fin_summary_data), use_container_width=True)
-
-
-
