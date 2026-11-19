@@ -134,6 +134,22 @@ def init_db():
     ''')
 
     c.execute('''
+        CREATE TABLE IF NOT EXISTS lifecycle_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT,
+            student_name TEXT,
+            dept_code TEXT,
+            target_status TEXT,
+            effective_date TEXT,
+            reason TEXT,
+            instructor_name TEXT,
+            status TEXT DEFAULT 'Pending',
+            admin_remarks TEXT,
+            submitted_at TEXT
+        )
+    ''')
+
+    c.execute('''
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -152,7 +168,25 @@ def init_db():
     conn.commit()
     conn.close()
 
+def sanitize_database_conflicts():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE attendance_logs
+        SET is_leave = 0, is_absent = 0
+        WHERE (is_present = 1 OR (clock_in IS NOT NULL AND TRIM(clock_in) != '')) AND is_leave > 0
+    ''')
+    c.execute('''
+        UPDATE attendance_logs
+        SET is_leave = 1, is_absent = 0
+        WHERE is_present = 0 AND is_leave > 1
+    ''')
+    conn.commit()
+    conn.close()
+
 init_db()
+sanitize_database_conflicts()
+
 
 def get_db_password(role_key):
     conn = sqlite3.connect(DB_FILE)
@@ -180,7 +214,7 @@ def load_all_attendance_logs():
     conn = sqlite3.connect(DB_FILE)
     try:
         df = pd.read_sql_query("SELECT * FROM attendance_logs", conn)
-        profiles_df = pd.read_sql_query("SELECT emp_id, status, withdrawal_date FROM student_profiles", conn)
+        profiles_df = pd.read_sql_query("SELECT emp_id, status, withdrawal_date, reinstated_date FROM student_profiles", conn)
     except Exception:
         df = pd.DataFrame()
         profiles_df = pd.DataFrame()
@@ -190,12 +224,15 @@ def load_all_attendance_logs():
         df['emp_id'] = df['emp_id'].apply(normalize_emp_id)
         if not profiles_df.empty:
             profiles_df['emp_id'] = profiles_df['emp_id'].apply(normalize_emp_id)
-            withdrawn_profiles = profiles_df[profiles_df['status'] == 'Withdrawn']
-            for _, w_row in withdrawn_profiles.iterrows():
-                w_id = w_row['emp_id']
-                w_date = w_row['withdrawal_date']
-                if w_date:
-                    df = df[~((df['emp_id'] == w_id) & (df['record_date'] >= w_date))]
+            for _, p_row in profiles_df.iterrows():
+                p_id = p_row['emp_id']
+                p_status = p_row['status']
+                w_date = p_row['withdrawal_date']
+                r_date = p_row['reinstated_date']
+                if p_status == 'Withdrawn' and w_date:
+                    df = df[~((df['emp_id'] == p_id) & (df['record_date'] >= w_date))]
+                elif p_status == 'Active' and w_date and r_date and w_date < r_date:
+                    df = df[~((df['emp_id'] == p_id) & (df['record_date'] >= w_date) & (df['record_date'] < r_date))]
 
     # --- GLOBAL DEPARTMENT SCOPE FILTER FOR INSTRUCTORS & VIEWERS ---
     if st.session_state.get('role') in ['Instructor', 'Viewer'] and st.session_state.get('selected_parent_dept'):
@@ -220,7 +257,6 @@ def load_student_profiles():
         target_p_dept = st.session_state['selected_parent_dept']
         if not df.empty and 'dept_code' in df.columns:
             valid_dept_codes = [code for code, (p_name, _) in PREFIX_MAP.items() if p_name == target_p_dept]
-            # Also match sub_dept or dept prefix
             df = df[df['dept_code'].apply(lambda x: any(str(x).startswith(prefix) for prefix in valid_dept_codes))]
 
     return df
@@ -231,8 +267,10 @@ def update_student_status(emp_id, status, date_str):
     norm_id = normalize_emp_id(emp_id)
     if status == 'Withdrawn':
         c.execute('''
-            UPDATE student_profiles SET status = ?, withdrawal_date = ? WHERE TRIM(emp_id) = TRIM(?)
-        ''', (status, date_str, norm_id))
+            UPDATE student_profiles 
+            SET status = 'Withdrawn', withdrawal_date = ?, reinstated_date = NULL 
+            WHERE TRIM(emp_id) = TRIM(?)
+        ''', (date_str, norm_id))
         c.execute('''
             UPDATE attendance_logs 
             SET is_present = 0, is_absent = 0, is_leave = 0, is_late = 0, clock_in = '', excuse_reason = 'Withdrawn'
@@ -240,8 +278,17 @@ def update_student_status(emp_id, status, date_str):
         ''', (norm_id, date_str))
     else:
         c.execute('''
-            UPDATE student_profiles SET status = ?, reinstated_date = ? WHERE TRIM(emp_id) = TRIM(?)
-        ''', (status, date_str, norm_id))
+            UPDATE student_profiles 
+            SET status = 'Active', reinstated_date = ? 
+            WHERE TRIM(emp_id) = TRIM(?)
+        ''', (date_str, norm_id))
+        c.execute('''
+            UPDATE attendance_logs 
+            SET excuse_reason = CASE WHEN excuse_reason = 'Withdrawn' THEN '' ELSE excuse_reason END,
+                is_present = CASE WHEN TRIM(COALESCE(clock_in, '')) != '' THEN 1 ELSE 0 END,
+                is_absent = CASE WHEN TRIM(COALESCE(clock_in, '')) = '' AND is_leave = 0 THEN 1 ELSE 0 END
+            WHERE TRIM(emp_id) = TRIM(?) AND record_date >= ?
+        ''', (norm_id, date_str))
     conn.commit()
     conn.close()
 
@@ -425,22 +472,52 @@ def save_records_to_db(df):
                 dept_code = excluded.dept_code
         ''', (norm_id, name, dept_code))
 
-        c.execute('''
-            INSERT INTO attendance_logs
-            (emp_id, name, record_date, shift_name, parent_dept, sub_dept, year, section, dept_code, clock_in, is_present, is_leave, is_absent, is_late, excuse_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '')
-            ON CONFLICT(emp_id, record_date, shift_name) DO UPDATE SET
-                name = excluded.name,
-                clock_in = excluded.clock_in,
-                is_present = excluded.is_present,
-                is_absent = CASE WHEN attendance_logs.is_leave = 1 THEN 0 ELSE excluded.is_absent END,
-                is_late = excluded.is_late
-        ''', (
-            norm_id, name, str(r['Date']).strip(), str(r['ShiftName']).strip(),
-            str(r['ParentDept']).strip(), str(r['SubDept']).strip(), str(r['Year']).strip(), str(r['Section']).strip(),
-            dept_code, str(r['ClockIn']).strip(), int(r['IsPresent']),
-            int(r['IsAbsent']), int(r['IsLate'])
-        ))
+        c.execute("SELECT status, withdrawal_date, reinstated_date FROM student_profiles WHERE TRIM(emp_id) = TRIM(?)", (norm_id,))
+        prof_state = c.fetchone()
+        rec_date_str = str(r['Date']).strip()
+        is_in_withdrawn_window = False
+        if prof_state:
+            st_val, w_dt, r_dt = prof_state
+            if st_val == 'Withdrawn' and w_dt and rec_date_str >= w_dt:
+                is_in_withdrawn_window = True
+            elif st_val == 'Active' and w_dt and r_dt and w_dt <= rec_date_str < r_dt:
+                is_in_withdrawn_window = True
+
+        if is_in_withdrawn_window:
+            c.execute('''
+                INSERT INTO attendance_logs
+                (emp_id, name, record_date, shift_name, parent_dept, sub_dept, year, section, dept_code, clock_in, is_present, is_leave, is_absent, is_late, excuse_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'Withdrawn')
+                ON CONFLICT(emp_id, record_date, shift_name) DO UPDATE SET
+                    name = excluded.name,
+                    clock_in = excluded.clock_in,
+                    is_present = 0,
+                    is_leave = 0,
+                    is_absent = 0,
+                    is_late = 0,
+                    excuse_reason = 'Withdrawn'
+            ''', (
+                norm_id, name, rec_date_str, str(r['ShiftName']).strip(),
+                str(r['ParentDept']).strip(), str(r['SubDept']).strip(), str(r['Year']).strip(), str(r['Section']).strip(),
+                dept_code, str(r['ClockIn']).strip()
+            ))
+        else:
+            c.execute('''
+                INSERT INTO attendance_logs
+                (emp_id, name, record_date, shift_name, parent_dept, sub_dept, year, section, dept_code, clock_in, is_present, is_leave, is_absent, is_late, excuse_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '')
+                ON CONFLICT(emp_id, record_date, shift_name) DO UPDATE SET
+                    name = excluded.name,
+                    clock_in = excluded.clock_in,
+                    is_present = excluded.is_present,
+                    is_absent = CASE WHEN attendance_logs.is_leave = 1 THEN 0 ELSE excluded.is_absent END,
+                    is_late = excluded.is_late
+            ''', (
+                norm_id, name, rec_date_str, str(r['ShiftName']).strip(),
+                str(r['ParentDept']).strip(), str(r['SubDept']).strip(), str(r['Year']).strip(), str(r['Section']).strip(),
+                dept_code, str(r['ClockIn']).strip(), int(r['IsPresent']),
+                int(r['IsAbsent']), int(r['IsLate'])
+            ))
     conn.commit()
     conn.close()
 
@@ -623,16 +700,26 @@ def apply_leave_and_status_filtering(df, leave_mapping):
             elif 'emp_id' in df.columns:
                 df = df[~df['emp_id'].isin(withdrawn_ids)]
 
+    # Initialize flags cleanly
     df['IsLeave'] = 0
     df['IsAbsent'] = 1 - df['IsPresent']
     
+    # CONFLICT PREVENTION: If someone clocked in, force IsAbsent = 0 and IsLeave = 0
+    if 'ClockIn' in df.columns:
+        valid_clock = df['ClockIn'].astype(str).str.strip() != ''
+        df.loc[valid_clock, 'IsPresent'] = 1
+        df.loc[valid_clock, 'IsAbsent'] = 0
+        df.loc[valid_clock, 'IsLeave'] = 0
+
     for code, l_val in leave_mapping.items():
         if l_val > 0:
-            absent_idx = df[(df['DeptCode'] == code) & (df['IsAbsent'] == 1)].index.tolist()
+            # ONLY target students who are truly absent AND did not clock in
+            absent_idx = df[(df['DeptCode'] == code) & (df['IsAbsent'] == 1) & (df['IsPresent'] == 0)].index.tolist()
             leave_targets = absent_idx[:l_val]
             if leave_targets:
                 df.loc[leave_targets, 'IsLeave'] = 1
                 df.loc[leave_targets, 'IsAbsent'] = 0
+                
     return df
 
 def build_html_report(df, leave_mapping, shift_title, report_date):
@@ -1527,27 +1614,30 @@ st.markdown(f"""
 user_role = st.session_state['role']
 
 if user_role == 'Admin':
-    tab1, tab_archive_admin, tab2, tab_leave_admin, tab3, tab4 = st.tabs([
+    tab1, tab_archive_admin, tab2, tab_leave_admin, tab3, tab4, tab_withdrawn_admin = st.tabs([
         "🚀 Process Daily Log", 
         "📋 Daily Records Archive", 
         "🚨 Warnings, Overrides & Lifecycles", 
         "📩 Leave Requests Queue", 
         "🔍 Student Profile Search", 
-        "💰 Monthly Fine Settlement"
+        "💰 Monthly Fine Settlement",
+        "🚫 Withdrawn & Reinstated Records"
     ])
 elif user_role == 'Instructor':
-    tab_leave_inst, tab_archive_inst, tab3_inst, tab4_inst = st.tabs([
-        "📩 Submit & Track Leaves",
+    tab_leave_inst, tab_archive_inst, tab3_inst, tab4_inst, tab_withdrawn_inst = st.tabs([
+        "📩 Submit & Track Leaves / Status",
         "📋 Daily Records Archive",
         "🔍 Student Profile Search",
-        "💰 Monthly Fine Summary"
+        "💰 Monthly Fine Summary",
+        "🚫 Withdrawn & Reinstated Records"
     ])
 else:
-    tab_archive, tab2, tab3, tab4 = st.tabs([
+    tab_archive, tab2, tab3, tab4, tab_withdrawn_view = st.tabs([
         "📋 Daily Records Archive",
         "🚨 Warning & Status View", 
         "🔍 Student Profile Search",
-        "💰 Monthly Fine Summary (View-Only)"
+        "💰 Monthly Fine Summary (View-Only)",
+        "🚫 Withdrawn & Reinstated Records"
     ])
 
 # --- TAB 1: DAILY LOG (ADMIN ONLY) ---
@@ -1658,15 +1748,10 @@ target_archive_tab = tab_archive_admin if user_role == 'Admin' else (tab_archive
 
 with target_archive_tab:
     st.markdown("### 📋 Daily Records & Historical Attendance Archive")
-    st.info("💡 Filter, review, and inspect historical attendance logs across dates, shifts, and sections. Withdrawn students are automatically excluded.")
+    st.info("💡 Filter, review, and inspect historical attendance logs across dates, shifts, and sections. Withdrawn periods are excluded while active/reinstated history remains intact.")
 
     df_db = load_all_attendance_logs()
     profiles_df = load_student_profiles()
-
-    if not df_db.empty and not profiles_df.empty:
-        withdrawn_set = set(profiles_df[profiles_df['status'] == 'Withdrawn']['emp_id'].tolist())
-        if withdrawn_set:
-            df_db = df_db[~df_db['emp_id'].isin(withdrawn_set)]
 
     if df_db.empty:
         st.warning("No active daily records found in the database yet.")
@@ -1720,23 +1805,33 @@ with target_archive_tab:
             st.markdown("#### Detailed Attendance Logs")
             st.dataframe(filtered_logs[['record_date', 'shift_name', 'emp_id', 'name', 'parent_dept', 'sub_dept', 'dept_code', 'clock_in', 'is_present', 'is_absent', 'is_leave', 'is_late', 'excuse_reason']], use_container_width=True)
 
-# --- TAB LEAVE: INSTRUCTOR LEAVE SUBMISSION & TRACKING ---
+# --- TAB LEAVE: INSTRUCTOR LEAVE & LIFECYCLE REQUEST SUBMISSION & TRACKING ---
 target_leave_inst_tab = tab_leave_inst if user_role == 'Instructor' else None
 
 if target_leave_inst_tab or user_role == 'Admin':
     leave_tab_context = target_leave_inst_tab if user_role == 'Instructor' else tab_leave_admin
     with leave_tab_context:
         if user_role == 'Instructor':
-            st.markdown(f"### 📩 Instructor Leave Request Portal — Welcome, {st.session_state['username']}")
-            st.info("💡 Submit multi-day medical or personal leave requests for students. You can track whether they are approved or rejected in real-time.")
+            st.markdown(f"### 📩 Instructor Leave & Student Status Request Portal — Welcome, {st.session_state['username']}")
+            st.info("💡 Submit multi-day leave requests or request **Withdrawn / Active (Reinstate)** status updates for students. Admin will review and apply approved requests.")
+
+            prof_inst = load_student_profiles()
+            df_db_l = load_all_attendance_logs()
+
+            if not prof_inst.empty:
+                all_studs = prof_inst[['emp_id', 'name', 'dept_code', 'status']].drop_duplicates().sort_values(by='emp_id')
+            elif not df_db_l.empty:
+                all_studs = df_db_l[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
+                all_studs['status'] = 'Active'
+            else:
+                all_studs = pd.DataFrame(columns=['emp_id', 'name', 'dept_code', 'status'])
 
             with st.form("instructor_leave_form"):
-                df_db_l = load_all_attendance_logs()
-                if df_db_l.empty:
+                st.markdown("#### 📝 Submit Multi-Day Leave Request")
+                if all_studs.empty:
                     st.warning("No student records available in database to request leave for.")
                 else:
-                    all_studs = df_db_l[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
-                    stud_opts = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_studs.iterrows()]
+                    stud_opts = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [{r.get('status', 'Active')}]" for _, r in all_studs.iterrows()]
                     
                     sel_stud_str = st.selectbox("Select Student:", stud_opts)
                     
@@ -1771,11 +1866,51 @@ if target_leave_inst_tab or user_role == 'Admin':
                             st.rerun()
 
             st.markdown("---")
-            st.markdown("#### 📊 Your Submitted Requests Status Tracker & Cancellation")
-            st.info("💡 If you made a mistake on a **Pending** request, you can cancel it directly below so it can be re-submitted correctly.")
+            with st.form("instructor_lifecycle_request_form"):
+                st.markdown("#### 🎓 Request Student Withdrawal or Reinstatement (Active)")
+                st.caption("Submit a request to mark a student **Withdrawn** or **Active** (reinstated). Admin reviews and approves the request before the status changes.")
+                if all_studs.empty:
+                    st.warning("No student profiles available in database.")
+                else:
+                    life_stud_opts = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Current: {r.get('status', 'Active')}]" for _, r in all_studs.iterrows()]
+                    sel_life_stud = st.selectbox("Select Student:", life_stud_opts, key="inst_life_stud_select")
+
+                    c_lc_a, c_lc_b = st.columns(2)
+                    with c_lc_a:
+                        req_target_status = st.selectbox("Requested Status:", ["Withdrawn", "Active"], key="inst_req_target_status")
+                    with c_lc_b:
+                        req_eff_date = st.date_input("Effective Date", value=date.today(), key="inst_req_eff_date")
+
+                    req_life_reason = st.text_area("Reason / Office Reference:", placeholder="e.g., Application approved by HOD / Student returned to class with clearance slip", key="inst_req_life_reason")
+
+                    submit_life_req = st.form_submit_button("📤 Submit Status Change Request", type="primary", use_container_width=True)
+
+                    if submit_life_req:
+                        if not req_life_reason.strip():
+                            st.error("❌ Please enter a reason or reference note for the status request.")
+                        else:
+                            l_id = normalize_emp_id(sel_life_stud.split(" - ")[0])
+                            l_name = sel_life_stud.split(" - ")[1].split(" (")[0]
+                            l_dept = sel_life_stud.split("(")[1].split(")")[0]
+
+                            conn_lr = sqlite3.connect(DB_FILE)
+                            c_lr = conn_lr.cursor()
+                            c_lr.execute('''
+                                INSERT INTO lifecycle_requests (emp_id, student_name, dept_code, target_status, effective_date, reason, instructor_name, status, submitted_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)
+                            ''', (l_id, l_name, l_dept, req_target_status, req_eff_date.strftime('%Y-%m-%d'), req_life_reason.strip(), st.session_state['username'], datetime.now().strftime('%Y-%m-%d %H:%M')))
+                            conn_lr.commit()
+                            conn_lr.close()
+                            st.success(f"✅ Status change request (**{req_target_status}** effective `{req_eff_date.strftime('%Y-%m-%d')}`) for {l_name} submitted to Admin!")
+                            st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 📊 Your Submitted Leave Requests Tracker & Cancellation")
+            st.info("💡 If you made a mistake on a **Pending** leave request, you can cancel it directly below so it can be re-submitted correctly.")
             
             conn_q = sqlite3.connect(DB_FILE)
             my_reqs = pd.read_sql_query("SELECT * FROM leave_requests WHERE instructor_name = ? ORDER BY request_id DESC", conn_q, params=(st.session_state['username'],))
+            my_life_reqs = pd.read_sql_query("SELECT * FROM lifecycle_requests WHERE instructor_name = ? ORDER BY request_id DESC", conn_q, params=(st.session_state['username'],))
             conn_q.close()
 
             if my_reqs.empty:
@@ -1810,6 +1945,40 @@ if target_leave_inst_tab or user_role == 'Admin':
                                 st.rerun()
                     st.markdown("---")
 
+            st.markdown("#### 🔄 Your Submitted Withdrawal / Reinstatement Requests Tracker")
+            if my_life_reqs.empty:
+                st.info("You have not submitted any student withdrawal or reinstatement requests yet.")
+            else:
+                for _, lr_row in my_life_reqs.iterrows():
+                    lrid = lr_row['request_id']
+                    lr_name = lr_row['student_name']
+                    lr_id = lr_row['emp_id']
+                    lr_sec = lr_row['dept_code']
+                    lr_target = lr_row['target_status']
+                    lr_eff = lr_row['effective_date']
+                    lr_reason = lr_row['reason']
+                    lr_stat = lr_row['status']
+                    lr_rem = lr_row['admin_remarks']
+
+                    col_lr1, col_lr2 = st.columns([3, 1])
+                    with col_lr1:
+                        st.markdown(f"**Status Request #{lrid}** | Student: **{lr_name}** (`{lr_id}`) — Section `{lr_sec}`")
+                        st.write(f"Requested Status: **{lr_target}** | Effective Date: `{lr_eff}` | Status: **{lr_stat}**")
+                        st.write(f"Reason: _{lr_reason}_")
+                        if lr_rem:
+                            st.write(f"Admin Remarks: _{lr_rem}_")
+                    with col_lr2:
+                        if lr_stat == 'Pending':
+                            if st.button(f"🗑️ Cancel Status Req #{lrid}", key=f"cancel_life_req_{lrid}", use_container_width=True):
+                                conn_c = sqlite3.connect(DB_FILE)
+                                cc = conn_c.cursor()
+                                cc.execute("DELETE FROM lifecycle_requests WHERE request_id = ? AND status = 'Pending'", (lrid,))
+                                conn_c.commit()
+                                conn_c.close()
+                                st.success(f"Status Request #{lrid} cancelled successfully.")
+                                st.rerun()
+                    st.markdown("---")
+
 # --- TAB 2: WARNINGS, OVERRIDES & STUDENT LIFECYCLE PORTAL ---
 if user_role in ['Admin', 'Viewer']:
     with tab2:
@@ -1821,24 +1990,35 @@ if user_role in ['Admin', 'Viewer']:
         df_db = load_all_attendance_logs()
         profiles_df = load_student_profiles()
 
-        if df_db.empty:
+        if df_db.empty and profiles_df.empty:
             st.info("No attendance records in history database yet.")
         else:
-            abs_summary = df_db.groupby(['emp_id', 'name', 'dept_code', 'sub_dept']).agg(
-                Total_Days=('record_date', 'nunique'),
-                Total_Absent=('is_absent', 'sum'),
-                Total_Late=('is_late', 'sum'),
-                Total_Leave=('is_leave', 'sum')
-            ).reset_index()
+            if not df_db.empty:
+                log_agg = df_db.groupby(['emp_id']).agg(
+                    Total_Days=('record_date', 'nunique'),
+                    Total_Absent=('is_absent', 'sum'),
+                    Total_Late=('is_late', 'sum'),
+                    Total_Leave=('is_leave', 'sum')
+                ).reset_index()
+            else:
+                log_agg = pd.DataFrame(columns=['emp_id', 'Total_Days', 'Total_Absent', 'Total_Late', 'Total_Leave'])
 
             if not profiles_df.empty:
-                abs_summary = abs_summary.merge(profiles_df[['emp_id', 'status', 'withdrawal_date', 'reinstated_date']], on='emp_id', how='left')
+                abs_summary = profiles_df[['emp_id', 'name', 'dept_code', 'status', 'withdrawal_date', 'reinstated_date']].merge(log_agg, on='emp_id', how='left')
+                for col_num in ['Total_Days', 'Total_Absent', 'Total_Late', 'Total_Leave']:
+                    abs_summary[col_num] = abs_summary[col_num].fillna(0).astype(int)
                 abs_summary['status'] = abs_summary['status'].fillna('Active')
             else:
+                abs_summary = df_db.groupby(['emp_id', 'name', 'dept_code', 'sub_dept']).agg(
+                    Total_Days=('record_date', 'nunique'),
+                    Total_Absent=('is_absent', 'sum'),
+                    Total_Late=('is_late', 'sum'),
+                    Total_Leave=('is_leave', 'sum')
+                ).reset_index()
                 abs_summary['status'] = 'Active'
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Logged Days", df_db['record_date'].nunique())
+            c1.metric("Total Logged Days", df_db['record_date'].nunique() if not df_db.empty else 0)
             c2.metric("1st Warning (4+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 4) & (abs_summary['status'] == 'Active')]))
             c3.metric("2nd Warning (8+ Abs)", len(abs_summary[(abs_summary['Total_Absent'] >= 8) & (abs_summary['status'] == 'Active')]))
             c4.metric("Total Withdrawn", len(abs_summary[abs_summary['status'] == 'Withdrawn']))
@@ -1864,10 +2044,80 @@ if user_role in ['Admin', 'Viewer']:
 
             if user_role == 'Admin':
                 st.markdown("---")
-                st.markdown("### 🎓 Student Lifecycle Manager (Active / Withdrawn)")
-                st.caption("Select a student to toggle their status between Active and Withdrawn. Withdrawn students are frozen from attendance counts and fine bills.")
+                st.markdown("### 📬 Instructor Withdrawal & Reinstatement Requests Queue")
+                st.info("💡 Review and approve/reject instructor requests to mark students **Withdrawn** or **Active** (reinstated), just like leave requests.")
 
-                all_stud_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Status: {r['status']}]" for _, r in abs_summary.iterrows()]
+                sub_lr_p, sub_lr_h = st.tabs(["⏳ Pending Status Requests", "📜 Status Request History"])
+
+                conn_lr_q = sqlite3.connect(DB_FILE)
+                pending_life_reqs = pd.read_sql_query("SELECT * FROM lifecycle_requests WHERE status = 'Pending' ORDER BY request_id ASC", conn_lr_q)
+                history_life_reqs = pd.read_sql_query("SELECT * FROM lifecycle_requests WHERE status IN ('Approved', 'Rejected') ORDER BY request_id DESC", conn_lr_q)
+                conn_lr_q.close()
+
+                with sub_lr_p:
+                    if pending_life_reqs.empty:
+                        st.success("🎉 No pending instructor withdrawal or reinstatement requests.")
+                    else:
+                        st.markdown(f"#### Pending Status Review Queue ({len(pending_life_reqs)} requests)")
+                        for _, lreq in pending_life_reqs.iterrows():
+                            lr_id = lreq['request_id']
+                            lr_emp = normalize_emp_id(lreq['emp_id'])
+                            lr_sname = lreq['student_name']
+                            lr_sec = lreq['dept_code']
+                            lr_tstat = lreq['target_status']
+                            lr_eff = lreq['effective_date']
+                            lr_rsn = lreq['reason']
+                            lr_inst = lreq['instructor_name']
+                            lr_sub = lreq['submitted_at']
+
+                            with st.container():
+                                col_p1, col_p2 = st.columns([3, 1])
+                                with col_p1:
+                                    st.markdown(f"#### 🔄 Status Request #{lr_id}: {lr_sname} (`{lr_emp}`) — Section `{lr_sec}`")
+                                    st.write(f"**Requested Status:** **{lr_tstat}** &nbsp;|&nbsp; **Effective Date:** `{lr_eff}`")
+                                    st.write(f"**Reason / Proof:** {lr_rsn}")
+                                    st.write(f"**Submitted By Instructor:** `{lr_inst}` at `{lr_sub}`")
+                                with col_p2:
+                                    lr_note = st.text_input("Admin Remarks", key=f"lr_rem_{lr_id}")
+                                    la1, la2 = st.columns(2)
+                                    with la1:
+                                        if st.button("✅ Approve", key=f"lr_app_{lr_id}", use_container_width=True):
+                                            update_student_status(lr_emp, lr_tstat, lr_eff)
+                                            conn_u = sqlite3.connect(DB_FILE)
+                                            cu = conn_u.cursor()
+                                            cu.execute("UPDATE lifecycle_requests SET status = 'Approved', admin_remarks = ? WHERE request_id = ?", (lr_note or f"Approved ({lr_tstat})", lr_id))
+                                            conn_u.commit()
+                                            conn_u.close()
+                                            st.success(f"Approved Status Request #{lr_id}: {lr_sname} is now **{lr_tstat}** effective `{lr_eff}`!")
+                                            st.rerun()
+                                    with la2:
+                                        if st.button("❌ Reject", key=f"lr_rej_{lr_id}", use_container_width=True):
+                                            conn_u = sqlite3.connect(DB_FILE)
+                                            cu = conn_u.cursor()
+                                            cu.execute("UPDATE lifecycle_requests SET status = 'Rejected', admin_remarks = ? WHERE request_id = ?", (lr_note or "Rejected by Admin", lr_id))
+                                            conn_u.commit()
+                                            conn_u.close()
+                                            st.warning(f"Rejected Status Request #{lr_id}.")
+                                            st.rerun()
+                                st.markdown("---")
+
+                with sub_lr_h:
+                    if history_life_reqs.empty:
+                        st.info("No processed withdrawal or reinstatement requests in history yet.")
+                    else:
+                        lr_app_cnt = len(history_life_reqs[history_life_reqs['status'] == 'Approved'])
+                        lr_rej_cnt = len(history_life_reqs[history_life_reqs['status'] == 'Rejected'])
+                        lha1, lha2 = st.columns(2)
+                        lha1.metric("Approved Status Requests", lr_app_cnt)
+                        lha2.metric("Rejected Status Requests", lr_rej_cnt)
+                        st.markdown("---")
+                        st.dataframe(history_life_reqs[['request_id', 'emp_id', 'student_name', 'dept_code', 'target_status', 'effective_date', 'reason', 'instructor_name', 'status', 'admin_remarks', 'submitted_at']], use_container_width=True)
+
+                st.markdown("---")
+                st.markdown("### 🎓 Student Lifecycle Manager (Direct Admin Control: Active / Withdrawn)")
+                st.caption("Select a student to directly toggle their status between Active and Withdrawn. Withdrawn students are frozen from attendance counts and fine bills during their withdrawal period, and reinstated cleanly from their effective active date.")
+
+                all_stud_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']}) [Status: {r['status']}]" for _, r in abs_summary.sort_values(by='emp_id').iterrows()]
                 selected_lifecycle_str = st.selectbox("Select Student for Lifecycle Update:", all_stud_options, key="lifecycle_student_select")
 
                 if selected_lifecycle_str:
@@ -1889,7 +2139,7 @@ if user_role in ['Admin', 'Viewer']:
 
                     if st.button("🔄 Update Student Lifecycle Status", type="primary", use_container_width=True):
                         update_student_status(sel_life_id, new_target_status, status_date.strftime('%Y-%m-%d'))
-                        st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}**!")
+                        st.success(f"Successfully updated student {sel_life_id} status to **{new_target_status}** effective `{status_date.strftime('%Y-%m-%d')}`!")
                         st.rerun()
                 st.markdown("---")
                 st.markdown("### ➕ Register a Missing Student")
@@ -1934,7 +2184,7 @@ if user_role in ['Admin', 'Viewer']:
                 st.markdown("### ⚡ Manual Record Override & Direct Leave Logger")
                 st.caption("Use this section to correct individual student log entries or record direct leaves.")
 
-                all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id')
+                all_students = df_db[['emp_id', 'name', 'dept_code']].drop_duplicates().sort_values(by='emp_id') if not df_db.empty else pd.DataFrame(columns=['emp_id', 'name', 'dept_code'])
                 student_options = [f"{str(r['emp_id']).strip()} - {r['name']} ({r['dept_code']})" for _, r in all_students.iterrows()]
                 
                 selected_student_str = st.selectbox("Select Student:", student_options, key="manual_override_student")
@@ -2161,6 +2411,7 @@ with current_profile_tab:
             p_row = profiles_df[profiles_df['emp_id'] == norm_sel_emp]
             status_val = p_row['status'].iloc[0] if not p_row.empty else 'Active'
             w_date = p_row['withdrawal_date'].iloc[0] if not p_row.empty else 'N/A'
+            r_date = p_row['reinstated_date'].iloc[0] if not p_row.empty and 'reinstated_date' in p_row.columns else None
 
             if not emp_records.empty:
                 emp_name = emp_records['name'].iloc[0]
@@ -2180,6 +2431,8 @@ with current_profile_tab:
                 with col_pr2:
                     if status_val == 'Withdrawn':
                         st.error(f"🔴 **STATUS: WITHDRAWN** (Since: {w_date})")
+                    elif r_date:
+                        st.success(f"🟢 **STATUS: ACTIVE** (Reinstated: {r_date})")
                     else:
                         st.success("🟢 **STATUS: ACTIVE**")
                 
@@ -2506,3 +2759,37 @@ with current_fine_tab:
                         'Warnings': warning_map.get(e_id, "Normal")
                     })
                 st.dataframe(pd.DataFrame(fin_summary_data), use_container_width=True)
+
+# --- TAB WITHDRAWN & REINSTATED: SHARED TRANSPARENCY REGISTRY ---
+target_withdrawn_tab = tab_withdrawn_admin if user_role == 'Admin' else (tab_withdrawn_inst if user_role == 'Instructor' else tab_withdrawn_view)
+
+with target_withdrawn_tab:
+    st.markdown("### 🚫 Withdrawn & Reinstated Students Registry")
+    st.info("Shared status record so everyone can see who is currently **Withdrawn** and who has been **Reinstated (`Active`)** after Admin approval or lifecycle update.")
+
+    prof_w = load_student_profiles()
+    if prof_w.empty:
+        st.info("No student status records found yet.")
+    else:
+        w_only = prof_w[prof_w['status'] == 'Withdrawn'].copy()
+        reinstated_only = prof_w[(prof_w['status'] == 'Active') & (prof_w['reinstated_date'].notna()) & (prof_w['reinstated_date'].astype(str).str.strip() != '')].copy()
+
+        wm1, wm2 = st.columns(2)
+        wm1.metric("Currently Withdrawn", len(w_only))
+        wm2.metric("Reinstated (Active)", len(reinstated_only))
+
+        st.markdown("---")
+        st.markdown("#### 🚫 Currently Withdrawn Students")
+        if w_only.empty:
+            st.success("No students are currently marked as Withdrawn.")
+        else:
+            w_cols = [c for c in ['emp_id', 'name', 'dept_code', 'status', 'withdrawal_date'] if c in w_only.columns]
+            st.dataframe(w_only[w_cols].sort_values(by=['dept_code', 'emp_id']), use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### 🔄 Reinstated Students Record (Returned to Active)")
+        if reinstated_only.empty:
+            st.info("No reinstated students recorded yet.")
+        else:
+            r_cols = [c for c in ['emp_id', 'name', 'dept_code', 'status', 'withdrawal_date', 'reinstated_date'] if c in reinstated_only.columns]
+            st.dataframe(reinstated_only[r_cols].sort_values(by=['reinstated_date', 'emp_id'], ascending=[False, True]), use_container_width=True)
